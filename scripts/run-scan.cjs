@@ -254,9 +254,27 @@ async function riotFetch(url) {
   return null;
 }
 
+/**
+ * Find the opponent champion from match data.
+ * Looks for the enemy player in the same teamPosition (role) on the opposite team.
+ */
+function findOpponentChampion(matchParticipants, puuid) {
+  const player = matchParticipants.find(p => p.puuid === puuid);
+  if (!player) return null;
+
+  const teamId = player.teamId; // 100 or 200
+  const position = (player.teamPosition || '').toUpperCase();
+
+  // Riot API: same teamPosition on the opposite team = lane opponent
+  const enemy = matchParticipants.find(
+    p => p.teamId !== teamId && p.teamPosition === position
+  );
+  return enemy?.championName || null;
+}
+
 async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
-  const { playerId, riotId, tag, region } = player;
-  console.log(`[RiotAPI] Scanning: ${riotId}#${tag}`);
+  const { playerId, riotId, tag, region, assignedRole } = player;
+  console.log(`[RiotAPI] Scanning: ${riotId}#${tag} (role filter: ${assignedRole || 'none'})`);
 
   if (await hasPlayerSoloqData(turso, playerId)) {
     console.log(`[RiotAPI] ${riotId}#${tag} already has data, skipping`);
@@ -282,7 +300,7 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
     return { gamesFound: 0, gamesImported: 0 };
   }
 
-  let gamesFound = 0, gamesImported = 0;
+  let gamesFound = 0, gamesMatched = 0, gamesImported = 0;
   for (let i = 0; i < matchIds.length; i++) {
     const matchData = await riotFetch(`https://${routing}.api.riotgames.com/lol/match/v5/matches/${matchIds[i]}`);
     if (!matchData?.info?.participants) continue;
@@ -293,13 +311,22 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
 
     const roleMap = { TOP: 'Top', JUNGLE: 'Jungle', MIDDLE: 'Mid', BOTTOM: 'Bot', UTILITY: 'Support', SUPPORT: 'Support' };
     const role = roleMap[(p.teamPosition || '').toUpperCase()] || null;
+
+    // Role filtering: skip if this game was played on a different role than assigned
+    if (assignedRole && role !== assignedRole) {
+      continue;
+    }
+    gamesMatched++;
+
+    // Opponent detection: find enemy champion in same role/position
+    const opponentChampion = findOpponentChampion(matchData.info.participants, puuid);
     const gameDate = new Date(matchData.info.gameCreation).toISOString().split('T')[0];
 
     try {
       await turso.execute({
-        sql: `INSERT OR IGNORE INTO soloq_games (player_id, workspace_id, source, game_date, champion, kills, deaths, assists, gold, cs, win, role)
-              VALUES (?, ?, 'riot-api', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        args: [playerId, WORKSPACE_ID, gameDate, p.championName,
+        sql: `INSERT OR IGNORE INTO soloq_games (player_id, workspace_id, source, game_date, champion, opponent_champion, kills, deaths, assists, gold, cs, win, role)
+              VALUES (?, ?, 'riot-api', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [playerId, WORKSPACE_ID, gameDate, p.championName, opponentChampion,
           p.kills || 0, p.deaths || 0, p.assists || 0,
           p.goldEarned || 0, (p.totalMinionsKilled || 0) + (p.neutralMinionsKilled || 0),
           p.win ? 1 : 0, role],
@@ -316,8 +343,8 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
     if (i % 5 === 0) await sleep(150);
   }
 
-  console.log(`[RiotAPI] ${riotId}#${tag}: ${gamesImported}/${gamesFound} games`);
-  return { gamesFound, gamesImported };
+  console.log(`[RiotAPI] ${riotId}#${tag}: ${gamesMatched}/${gamesFound} role-matched, ${gamesImported} imported`);
+  return { gamesFound, gamesMatched, gamesImported };
 }
 
 // ─── Step 3: Leaguepedia Competitive ──────────────────────────────────
@@ -335,6 +362,35 @@ async function fetchLeaguepediaCargo(params) {
   return null;
 }
 
+/**
+ * Resolve opponent champion from ScoreboardGames for a specific game.
+ * Fetches the enemy player in the same role on the opposite team.
+ */
+async function resolveCompOpponent(turso, gameId, playerTeam, role) {
+  if (!gameId || !role) return null;
+  try {
+    const data = await fetchLeaguepediaCargo({
+      tables: 'ScoreboardGames',
+      fields: 'Champion',
+      where: `GameId = "${gameId}" AND Team != "${playerTeam}" AND Role = "${role}"`,
+      limit: '1',
+      format: 'json',
+    });
+    if (data) {
+      let rows = [];
+      if (typeof data === 'string') { try { rows = JSON.parse(data); } catch { return null; } }
+      else if (Array.isArray(data)) { rows = data; }
+      else if (data?.response) { rows = data.response; }
+      if (rows.length > 0) {
+        return normalizeChampionName(rows[0].Champion || rows[0].champion || '');
+      }
+    }
+  } catch {
+    // Silently fail — opponent is optional
+  }
+  return null;
+}
+
 async function scanCompetitive(turso, player) {
   const { playerId, riotId, tag, playerOverrideName, leaguepediaUrl } = player;
   const lpName = playerOverrideName || (leaguepediaUrl ? decodeURIComponent(leaguepediaUrl.match(/wiki\/([^/?]+)/)?.[1] || '') : riotId);
@@ -345,14 +401,14 @@ async function scanCompetitive(turso, player) {
     return { gamesImported: 0, skipped: true };
   }
 
-  // Fetch champion pool from Leaguepedia ScoreboardPlayers
+  // Fetch per-game data from ScoreboardGames (real dates, KDA, opponent, role)
   const data = await fetchLeaguepediaCargo({
-    tables: 'ScoreboardPlayers',
-    fields: 'ScoreboardPlayers.Champion, ScoreboardPlayers.Team, COUNT(*) AS games, SUM(ScoreboardPlayers.Win) AS wins',
-    where: `ScoreboardPlayers.Link = "${lpName}"`,
-    group_by: 'ScoreboardPlayers.Champion, ScoreboardPlayers.Team',
-    format: 'json',
+    tables: 'ScoreboardGames',
+    fields: 'GameId, Champion, Team, Side, Kills, Deaths, Assists, Win, DateTime_UTC, Tournament, Role',
+    where: `Player = "${lpName}"`,
     limit: '500',
+    format: 'json',
+    order_by: 'DateTime_UTC DESC',
   });
 
   if (!data) {
@@ -375,31 +431,68 @@ async function scanCompetitive(turso, player) {
     return { gamesImported: 0 };
   }
 
+  // Collect unique GameIds for batch opponent resolution
+  const gameIdToOpponent = {};
+
   let totalImported = 0;
   for (const row of rows) {
     const champion = normalizeChampionName(row.Champion || row.champion || '');
     if (!champion) continue;
 
-    const games = parseInt(row.games || row.Games || 0);
-    const wins = parseInt(row.wins || row.Wins || 0);
-    if (games === 0) continue;
+    const gameId = row.GameId || row.gameId || '';
+    const team = row.Team || row.team || '';
+    const side = row.Side || row.side || '';
+    const role = row.Role || row.role || '';
+    const tournament = row.Tournament || row.tournament || 'Pro Play';
+    const win = row.Win === true || row.Win === 1 || row.win === true || row.win === 1 ? 1 : 0;
+    const kills = parseInt(row.Kills || row.kills || 0);
+    const deaths = parseInt(row.Deaths || row.deaths || 0);
+    const assists = parseInt(row.Assists || row.assists || 0);
+    const gameDate = row.DateTime_UTC || row.date || new Date().toISOString().split('T')[0];
 
-    // Store each game
-    for (let g = 0; g < games; g++) {
-      try {
-        await turso.execute({
-          sql: `INSERT OR IGNORE INTO competitive_games (player_id, workspace_id, game_date, champion, tournament, opponent, win)
-                VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          args: [playerId, WORKSPACE_ID, new Date().toISOString().split('T')[0], champion, 'Pro Play', row.Team || row.team || 'Unknown', wins / games > 0.5 ? 1 : 0],
-        });
-      } catch (err) {
-        if (!err.message.includes('UNIQUE')) console.warn(`[Competitive] Insert error: ${err.message}`);
+    // Map Leaguepedia roles to standard format
+    const roleMap = {
+      'Top': 'Top', 'Top Laner': 'Top',
+      'Jungle': 'Jungle', 'Jungler': 'Jungle',
+      'Mid': 'Mid', 'Middle': 'Mid', 'Mid Laner': 'Mid',
+      'Bot': 'Bot', 'ADC': 'Bot', 'Bottom': 'Bot', 'Bot Laner': 'Bot',
+      'Support': 'Support', 'Utility': 'Support',
+    };
+    const mappedRole = roleMap[role] || role || null;
+
+    // Resolve opponent champion (lazy once per GameId)
+    let opponentChampion = null;
+    if (gameId && team && mappedRole) {
+      if (!gameIdToOpponent[gameId]) {
+        gameIdToOpponent[gameId] = await resolveCompOpponent(turso, gameId, team, role);
+        await sleep(100); // rate limit
       }
+      opponentChampion = gameIdToOpponent[gameId];
     }
-    totalImported += games;
+
+    try {
+      await turso.execute({
+        sql: `INSERT OR IGNORE INTO competitive_games 
+              (player_id, workspace_id, leaguepedia_game_id, game_date, champion, opponent_champion, tournament, opponent, win, kills, deaths, assists, side, role)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          playerId, WORKSPACE_ID, gameId,
+          gameDate, champion, opponentChampion,
+          tournament, '', win,
+          kills, deaths, assists,
+          side, mappedRole,
+        ],
+      });
+      totalImported++;
+    } catch (err) {
+      if (!err.message.includes('UNIQUE')) console.warn(`[Competitive] Insert error: ${err.message}`);
+    }
+
+    await reportProgress({ step: 'competitive', playerId, playerName: lpName, status: 'scanning',
+      gamesImported: totalImported, progress: ((rows.indexOf(row) + 1) / rows.length * 100).toFixed(1) });
   }
 
-  console.log(`[Competitive] ${lpName}: ${totalImported} games imported`);
+  console.log(`[Competitive] ${lpName}: ${totalImported} games imported with real per-game data`);
   return { gamesImported: totalImported };
 }
 
@@ -435,6 +528,132 @@ async function importTeamData(turso, team, tournamentName) {
   }
 
   return { importedGames };
+}
+
+// ─── Step 5: Post-import aggregation ─────────────────────────────────
+
+/**
+ * Compute champion_stats and champion_matchups from raw game data.
+ * Runs after all imports to ensure aggregates are up-to-date.
+ */
+async function computeAggregates(turso, playerIds) {
+  console.log('\n=== Step 5: Computing Aggregates ===');
+  await reportProgress({ step: 'aggregation', status: 'started' });
+
+  // Clear existing aggregates for these players to avoid stale data
+  for (const playerId of playerIds) {
+    // Delete old soloq champion_stats for this player
+    await turso.execute({
+      sql: `DELETE FROM champion_stats WHERE player_id = ? AND workspace_id = ? AND source = 'soloq'`,
+      args: [playerId, WORKSPACE_ID],
+    });
+
+    // Delete old competitive champion_stats
+    await turso.execute({
+      sql: `DELETE FROM champion_stats WHERE player_id = ? AND workspace_id = ? AND source = 'competitive'`,
+      args: [playerId, WORKSPACE_ID],
+    });
+
+    // Delete old matchups
+    await turso.execute({
+      sql: `DELETE FROM champion_matchups WHERE player_id = ? AND workspace_id = ?`,
+      args: [playerId, WORKSPACE_ID],
+    });
+  }
+
+  // Rebuild champion_stats from soloq_games
+  await turso.execute({
+    sql: `INSERT INTO champion_stats
+          (player_id, workspace_id, champion, source, role, role_key,
+           games, wins, losses, winrate,
+           avg_kills, avg_deaths, avg_assists, avg_gold, avg_cs,
+           first_seen, last_seen, computed_at)
+          SELECT
+            player_id, workspace_id, champion, 'soloq',
+            role, COALESCE(role, 'unknown'),
+            COUNT(*) as games,
+            SUM(CASE WHEN win = 1 THEN 1 ELSE 0 END) as wins,
+            SUM(CASE WHEN win = 0 THEN 1 ELSE 0 END) as losses,
+            AVG(CASE WHEN win = 1 THEN 100.0 ELSE 0 END) as winrate,
+            AVG(kills), AVG(deaths), AVG(assists), AVG(gold), AVG(cs),
+            MIN(game_date), MAX(game_date), datetime('now')
+          FROM soloq_games
+          WHERE workspace_id = ? AND player_id IN (${playerIds.map(() => '?').join(',')})
+          GROUP BY player_id, workspace_id, champion, role`,
+    args: [WORKSPACE_ID, ...playerIds],
+  });
+
+  // Rebuild champion_stats from competitive_games
+  await turso.execute({
+    sql: `INSERT INTO champion_stats
+          (player_id, workspace_id, champion, source, role, role_key,
+           games, wins, losses, winrate,
+           avg_kills, avg_deaths, avg_assists, avg_gold, avg_cs,
+           first_seen, last_seen, computed_at)
+          SELECT
+            player_id, workspace_id, champion, 'competitive',
+            role, COALESCE(role, 'unknown'),
+            COUNT(*) as games,
+            SUM(CASE WHEN win = 1 THEN 1 ELSE 0 END) as wins,
+            SUM(CASE WHEN win = 0 THEN 1 ELSE 0 END) as losses,
+            AVG(CASE WHEN win = 1 THEN 100.0 ELSE 0 END) as winrate,
+            AVG(kills), AVG(deaths), AVG(assists), AVG(gold), AVG(cs),
+            MIN(game_date), MAX(game_date), datetime('now')
+          FROM competitive_games
+          WHERE workspace_id = ? AND player_id IN (${playerIds.map(() => '?').join(',')})
+          GROUP BY player_id, workspace_id, champion, role`,
+    args: [WORKSPACE_ID, ...playerIds],
+  });
+
+  // Rebuild champion_matchups from soloq_games
+  await turso.execute({
+    sql: `INSERT INTO champion_matchups
+          (player_id, workspace_id, champion, opponent_champion, source, role_key,
+           games, wins, losses, winrate,
+           avg_kills, avg_deaths, avg_assists,
+           first_seen, last_seen, computed_at)
+          SELECT
+            player_id, workspace_id, champion, opponent_champion, 'soloq',
+            COALESCE(role, 'unknown'),
+            COUNT(*) as games,
+            SUM(CASE WHEN win = 1 THEN 1 ELSE 0 END) as wins,
+            SUM(CASE WHEN win = 0 THEN 1 ELSE 0 END) as losses,
+            AVG(CASE WHEN win = 1 THEN 100.0 ELSE 0 END) as winrate,
+            AVG(kills), AVG(deaths), AVG(assists),
+            MIN(game_date), MAX(game_date), datetime('now')
+          FROM soloq_games
+          WHERE workspace_id = ? AND player_id IN (${playerIds.map(() => '?').join(',')})
+            AND opponent_champion IS NOT NULL
+          GROUP BY player_id, workspace_id, champion, opponent_champion, role`,
+    args: [WORKSPACE_ID, ...playerIds],
+  });
+
+  // Rebuild champion_matchups from competitive_games
+  await turso.execute({
+    sql: `INSERT INTO champion_matchups
+          (player_id, workspace_id, champion, opponent_champion, source, role_key,
+           games, wins, losses, winrate,
+           avg_kills, avg_deaths, avg_assists,
+           first_seen, last_seen, computed_at)
+          SELECT
+            player_id, workspace_id, champion, opponent_champion, 'competitive',
+            COALESCE(role, 'unknown'),
+            COUNT(*) as games,
+            SUM(CASE WHEN win = 1 THEN 1 ELSE 0 END) as wins,
+            SUM(CASE WHEN win = 0 THEN 1 ELSE 0 END) as losses,
+            AVG(CASE WHEN win = 1 THEN 100.0 ELSE 0 END) as winrate,
+            AVG(kills), AVG(deaths), AVG(assists),
+            MIN(game_date), MAX(game_date), datetime('now')
+          FROM competitive_games
+          WHERE workspace_id = ? AND player_id IN (${playerIds.map(() => '?').join(',')})
+            AND opponent_champion IS NOT NULL
+          GROUP BY player_id, workspace_id, champion, opponent_champion, role`,
+    args: [WORKSPACE_ID, ...playerIds],
+  });
+
+  await logStep(turso, 'aggregation', 0);
+  console.log('[Aggregation] Complete');
+  await reportProgress({ step: 'aggregation', status: 'completed' });
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────
@@ -545,6 +764,13 @@ async function main() {
     } else {
       console.log('[Resume] Team import already complete, skipping');
     }
+  }
+
+  // ── Step 5: Compute Aggregates ────────────────────────────────
+  if (!await isStepComplete(turso, 'aggregation')) {
+    await computeAggregates(turso, players.map(p => p.playerId));
+  } else {
+    console.log('[Resume] Aggregation already complete, skipping');
   }
 
   // ── Done ─────────────────────────────────────────────────────────
