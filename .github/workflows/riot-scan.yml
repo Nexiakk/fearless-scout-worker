@@ -1,0 +1,59 @@
+name: Full Scouting Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Unique job ID for tracking progress'
+        required: true
+      workspaceId:
+        description: 'Firestore workspace ID'
+        required: true
+      mode:
+        description: '"fresh" for full scan, "resume" to skip already-done work'
+        required: false
+        default: 'fresh'
+      players:
+        description: 'JSON array of { playerId, riotId, tag, region, leaguepediaUrl, playerOverrideName }'
+        required: true
+      options:
+        description: 'JSON: { doSoloq, soloqMethod (opgg|riot-api), doCompetitive, doTeam, dataRange: {type, startDate?, endDate?} }'
+        required: true
+      team:
+        description: 'JSON: { teamId, teamName, leaguepediaUrl, selectedTournaments } or empty'
+        required: false
+        default: '{}'
+      callbackUrl:
+        description: 'Netlify function URL for progress updates'
+        required: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci --production
+
+      - name: Run full scouting scan
+        run: node scripts/run-scan.cjs
+        env:
+          RIOT_API_KEY: ${{ secrets.RIOT_API_KEY }}
+          TURSO_SCOUTING_URL: ${{ secrets.TURSO_SCOUTING_URL }}
+          TURSO_SCOUTING_TOKEN: ${{ secrets.TURSO_SCOUTING_TOKEN }}
+          JOB_ID: ${{ inputs.jobId }}
+          WORKSPACE_ID: ${{ inputs.workspaceId }}
+          MODE: ${{ inputs.mode }}
+          PLAYERS_JSON: ${{ inputs.players }}
+          OPTIONS_JSON: ${{ inputs.options }}
+          TEAM_JSON: ${{ inputs.team }}
+          CALLBACK_URL: ${{ inputs.callbackUrl }}
