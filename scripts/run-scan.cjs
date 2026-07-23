@@ -130,6 +130,7 @@ function createHumanLabel(step, playerName, currentPlayer, totalPlayers) {
 
 // Lazy-loaded Firestore client for progress writes
 let _firestoreDb = null;
+let _startedAt = null; // Preserved across progress updates without a DB read-back
 
 async function getFirestoreDb() {
   if (_firestoreDb) return _firestoreDb;
@@ -188,16 +189,33 @@ async function reportProgress(progress) {
       const now = new Date();
       const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000); // 7-day TTL
 
-      const status =
-        progress.status === "completed" || progress.status === "failed"
-          ? progress.status
-          : progress.status === "started"
-            ? "running"
-            : "running";
+      // Overall status only changes at job lifecycles (started → completed/failed at the very end)
+      // Step-level completions/started use stepStatus so they don't trigger auto-dismiss
+      const isJobTerminal = progress.step == null && (progress.status === "completed" || progress.status === "failed");
+      const status = isJobTerminal
+        ? progress.status
+        : "running";
+
+      const stepStatus =
+        progress.step != null
+          ? progress.status === "completed"
+            ? "step_completed"
+            : progress.status === "failed"
+              ? "step_failed"
+              : progress.status === "started"
+                ? "step_active"
+                : "step_active"
+          : null;
+
+      // Set startedAt once at the beginning, preserve via module-level variable
+      if (progress.status === "started") {
+        _startedAt = now.toISOString();
+      }
 
       const docData = {
         workspaceId: WORKSPACE_ID,
         status,
+        stepStatus,
         step: step || "init",
         stepLabel,
         playerName: progress.playerName || null,
@@ -205,25 +223,10 @@ async function reportProgress(progress) {
         total: progress.totalPlayers || 0,
         message: stepLabel,
         error: progress.error || null,
-        startedAt: progress.status === "started" ? now.toISOString() : null,
+        startedAt: _startedAt,
         updatedAt: now.toISOString(),
         expiresAt: expiresAt.toISOString(),
       };
-
-      // Merge startedAt if doc already exists (preserve original startedAt)
-      if (progress.status !== "started") {
-        try {
-          const existing = await db.collection("scoutJobs").doc(JOB_ID).get();
-          if (existing.exists) {
-            const existingData = existing.data();
-            if (existingData.startedAt) {
-              docData.startedAt = existingData.startedAt;
-            }
-          }
-        } catch {
-          /* ignore read errors */
-        }
-      }
 
       await db
         .collection("scoutJobs")
@@ -381,7 +384,7 @@ async function scrapeOpgg(turso, player, options) {
       for (let g = 0; g < games; g++) {
         try {
           await turso.execute({
-            sql: `INSERT INTO soloq_games (player_id, workspace_id, source, game_date, champion, kills, deaths, assists, gold, cs, win, role)
+            sql: `INSERT OR IGNORE INTO soloq_games (player_id, workspace_id, source, game_date, champion, kills, deaths, assists, gold, cs, win, role)
                   VALUES (?, ?, 'opgg', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
             args: [
               playerId,
@@ -548,8 +551,8 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
 
     try {
       await turso.execute({
-        sql: `INSERT OR IGNORE INTO soloq_games (player_id, workspace_id, source, game_date, champion, opponent_champion, kills, deaths, assists, gold, cs, win, role)
-              VALUES (?, ?, 'riot-api', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sql: `INSERT OR IGNORE INTO soloq_games (player_id, workspace_id, source, game_date, champion, opponent_champion, kills, deaths, assists, gold, cs, win, role, match_id)
+              VALUES (?, ?, 'riot-api', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           playerId,
           WORKSPACE_ID,
@@ -563,6 +566,7 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
           (p.totalMinionsKilled || 0) + (p.neutralMinionsKilled || 0),
           p.win ? 1 : 0,
           role,
+          matchIds[i],
         ],
       });
       gamesImported++;
@@ -767,12 +771,13 @@ async function scanCompetitive(turso, player) {
     try {
       await turso.execute({
         sql: `INSERT OR IGNORE INTO competitive_games 
-              (player_id, workspace_id, leaguepedia_game_id, game_date, champion, opponent_champion, tournament, opponent, team, win, kills, deaths, assists, cs, gold, vision, damage, duration, side, role)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              (player_id, workspace_id, source, source_game_id, leaguepedia_game_id, game_date, champion, opponent_champion, tournament, opponent, team, win, kills, deaths, assists, cs, gold, vision, damage, duration, side, role)
+              VALUES (?, ?, 'leaguepedia', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           playerId,
           WORKSPACE_ID,
-          gameId,
+          gameId,  // source_game_id
+          gameId,  // leaguepedia_game_id
           gameDate,
           champion,
           opponentChampion,
@@ -904,6 +909,10 @@ async function main() {
     ? Math.floor(new Date(dataRange.endDate).getTime() / 1000)
     : null;
 
+  // Track total games across all steps for a single import_log row at the end
+  let totalGamesAllSteps = 0;
+  let totalErrorsAllSteps = 0;
+
   await reportProgress({ status: "started", totalPlayers: players.length });
 
   // ── Step 1: op.gg SoloQ ─────────────────────────────────────────
@@ -927,13 +936,8 @@ async function main() {
         if (result.error) totalErrors++;
       }
 
-      await logStep(
-        turso,
-        "soloq_opgg",
-        totalGames,
-        totalErrors > 0 ? "partial" : "success",
-        totalErrors > 0 ? `${totalErrors} players had errors` : null,
-      );
+      totalGamesAllSteps += totalGames;
+      totalErrorsAllSteps += totalErrors;
       await reportProgress({ step: "opgg", status: "completed", totalGames });
     } else {
       console.log("[Resume] op.gg SoloQ already complete, skipping");
@@ -970,7 +974,7 @@ async function main() {
           totalImported += result.gamesImported || 0;
           await sleep(500);
         }
-        await logStep(turso, "soloq_riot_api", totalImported);
+        totalGamesAllSteps += totalImported;
         await reportProgress({
           step: "riot-api",
           status: "completed",
@@ -1015,17 +1019,10 @@ async function main() {
         }
 
         totalImported += result.gamesImported || 0;
-        await logStep(
-          turso,
-          `competitive|${players[i].playerId}`,
-          result.gamesImported || 0,
-          result.error ? "partial" : "success",
-          result.error || null,
-        );
 
         await sleep(300);
       }
-      await logStep(turso, "competitive", totalImported);
+      totalGamesAllSteps += totalImported;
       await reportProgress({
         step: "competitive",
         status: "completed",
@@ -1050,7 +1047,7 @@ async function main() {
         const result = await importTeamData(turso, team, tournament);
         totalImported += result.importedGames || 0;
       }
-      await logStep(turso, "team_import", totalImported);
+      totalGamesAllSteps += totalImported;
       await reportProgress({
         step: "team",
         status: "completed",
@@ -1068,6 +1065,15 @@ async function main() {
     "[Aggregation] Using raw-data query architecture — precomputed tables deprecated",
   );
   await reportProgress({ step: "aggregation", status: "completed" });
+
+  // ── Single import_log row for the entire run ─────────────────────
+  await logStep(
+    turso,
+    "full_scan",
+    totalGamesAllSteps,
+    totalErrorsAllSteps > 0 ? "partial" : "success",
+    totalErrorsAllSteps > 0 ? `${totalErrorsAllSteps} steps had errors` : null,
+  );
 
   // ── Done ─────────────────────────────────────────────────────────
   console.log("\n=== Scan Complete! ===");
