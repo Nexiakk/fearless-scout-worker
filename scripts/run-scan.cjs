@@ -235,6 +235,28 @@ async function reportProgress(progress) {
   }
 }
 
+// ─── Firestore lock release ──────────────────────────────────────────
+// Releases the scan lock from the workspace's _scouting/lock document
+// so that new scans can be dispatched after completion or failure.
+async function releaseFirestoreLock() {
+  try {
+    const db = await getFirestoreDb();
+    if (!db) return;
+    await db
+      .collection('workspaces')
+      .doc(WORKSPACE_ID)
+      .collection('_scouting')
+      .doc('lock')
+      .delete();
+    console.log(`[Lock] Released Firestore lock for workspace ${WORKSPACE_ID}`);
+  } catch (err) {
+    // If the lock document doesn't exist or was already deleted, that's fine
+    if (!err.message?.includes('not-found') && !err.message?.includes('NOT_FOUND')) {
+      throw err;
+    }
+  }
+}
+
 // ─── Resume helpers ───────────────────────────────────────────────────
 
 async function isStepComplete(turso, stepType) {
@@ -290,9 +312,9 @@ async function scrapeOpgg(turso, player, options) {
   const { playerId, riotId, tag, region } = player;
   console.log(`::notice::[op.gg] Scraping: ${riotId}#${tag}`);
 
-  // Check resume
-  if (await hasPlayerSoloqData(turso, playerId)) {
-    console.log(`[op.gg] ${riotId}#${tag} already has SoloQ data, skipping`);
+  // Only skip in resume mode — fresh scans always re-fetch (INSERT OR IGNORE handles duplicates)
+  if (MODE === "resume" && await hasPlayerSoloqData(turso, playerId)) {
+    console.log(`[op.gg] ${riotId}#${tag} already has SoloQ data, skipping (resume mode)`);
     return { gamesImported: 0, skipped: true };
   }
 
@@ -449,8 +471,8 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
     `[RiotAPI] Scanning: ${riotId}#${tag} (role filter: ${assignedRole || "none"})`,
   );
 
-  if (await hasPlayerSoloqData(turso, playerId)) {
-    console.log(`[RiotAPI] ${riotId}#${tag} already has data, skipping`);
+  if (MODE === "resume" && await hasPlayerSoloqData(turso, playerId)) {
+    console.log(`[RiotAPI] ${riotId}#${tag} already has data, skipping (resume mode)`);
     return { gamesFound: 0, gamesImported: 0, skipped: true };
   }
 
@@ -604,8 +626,8 @@ async function scanCompetitive(turso, player) {
     `::notice::[Competitive] Scanning player: ${lpName} (playerId: ${playerId})`,
   );
 
-  if (await hasPlayerCompData(turso, playerId)) {
-    console.log(`[Competitive] ${lpName} already has data, skipping`);
+  if (MODE === "resume" && await hasPlayerCompData(turso, playerId)) {
+    console.log(`[Competitive] ${lpName} already has data, skipping (resume mode)`);
     return { gamesImported: 0, skipped: true };
   }
 
@@ -1054,6 +1076,11 @@ async function main() {
     status: "completed",
     completedAt: new Date().toISOString(),
   });
+
+  // Release Firestore lock so other scans can proceed
+  await releaseFirestoreLock().catch(err => {
+    console.warn(`[Cleanup] Failed to release lock: ${err.message}`);
+  });
 }
 
 main().catch(async (error) => {
@@ -1062,5 +1089,7 @@ main().catch(async (error) => {
   await reportProgress({ status: "failed", error: error.message }).catch(
     () => {},
   );
+  // Release Firestore lock on failure too
+  await releaseFirestoreLock().catch(() => {});
   process.exit(1);
 });
