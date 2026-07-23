@@ -109,6 +109,7 @@ const STAGE_LABELS = {
   "riot-api": { label: "Riot API SoloQ", icon: "⚔️" },
   competitive: { label: "Leaguepedia Competitive", icon: "🏆" },
   team: { label: "Team Import", icon: "👥" },
+  grid: { label: "Grid.gg Team Import", icon: "🏟️" },
   aggregation: { label: "Post-import Aggregation", icon: "📊" },
 };
 
@@ -149,14 +150,22 @@ async function reportProgress(progress) {
   const stage = getStageLabel(step);
 
   // Build human-readable label
-  const stepLabel =
-    progress.stepLabel ||
-    createHumanLabel(
-      step,
-      progress.playerName,
-      progress.currentPlayer,
-      progress.totalPlayers,
-    );
+  // For overall job completion (no step), use a clear label instead of falling back to "Starting scan..."
+  let stepLabel;
+  if (progress.status === "completed" && step == null) {
+    stepLabel = "✅ Scan complete";
+  } else if (progress.status === "failed" && step == null) {
+    stepLabel = "❌ Scan failed";
+  } else {
+    stepLabel =
+      progress.stepLabel ||
+      createHumanLabel(
+        step,
+        progress.playerName,
+        progress.currentPlayer,
+        progress.totalPlayers,
+      );
+  }
 
   // Build payload for callback
   const payload = {
@@ -303,7 +312,7 @@ async function hasPlayerCompData(turso, playerId) {
 
 async function hasTeamData(turso, teamId, tournament) {
   const result = await turso.execute({
-    sql: `SELECT COUNT(*) as cnt FROM team_games WHERE team_id = ? AND tournament = ? AND source = 'gridgg'`,
+    sql: `SELECT COUNT(*) as cnt FROM team_games WHERE team_id = ? AND tournament = ? AND (source = 'grid' OR source = 'gridgg')`,
     args: [teamId, tournament],
   });
   return (result.rows[0]?.cnt || 0) > 0;
@@ -833,6 +842,12 @@ async function importTeamData(turso, team, tournamentName) {
     return { importedGames: 0, skipped: true };
   }
 
+  // If team has a gridTeamId, use Grid.gg API for real data
+  if (team.gridTeamId) {
+    return await importTeamDataFromGrid(turso, team, tournamentName);
+  }
+
+  // Fallback: insert placeholder row (legacy behavior)
   let importedGames = 0;
   try {
     await turso.execute({
@@ -858,6 +873,203 @@ async function importTeamData(turso, team, tournamentName) {
   }
 
   return { importedGames };
+}
+
+/**
+ * Import team data from Grid.gg API.
+ * Fetches series, draft data, and Riot summary files for the team's tournaments.
+ */
+async function importTeamDataFromGrid(turso, team, tournamentName) {
+  console.log(`[Grid] Importing ${team.teamName} from Grid.gg for tournament: ${tournamentName}`);
+  await reportProgress({ step: "grid", status: "started", tournament: tournamentName });
+
+  const grid = require("./grid-client.cjs");
+  grid.initialize(championMapper);
+
+  // Fetch series for this team from Grid
+  const dataRange = JSON.parse(OPTIONS_JSON).dataRange || {};
+  const options = {
+    limit: 50,
+  };
+  if (dataRange.startDate) options.startTimeGte = new Date(dataRange.startDate).toISOString();
+  if (dataRange.endDate) options.startTimeLte = new Date(dataRange.endDate).toISOString();
+
+  const series = await grid.fetchSeriesByTeamId(team.gridTeamId, options);
+  console.log(`[Grid] Found ${series.length} series for team ${team.teamName}`);
+
+  // Filter series by tournament name if specified
+  const filteredSeries = tournamentName
+    ? series.filter(s => s.tournament?.name === tournamentName || s.tournament?.nameShortened === tournamentName)
+    : series;
+
+  console.log(`[Grid] ${filteredSeries.length} series match tournament "${tournamentName}"`);
+
+  let importedGames = 0;
+  let importedPlayers = 0;
+
+  for (const s of filteredSeries) {
+    await reportProgress({
+      step: "grid",
+      status: "scanning",
+      seriesId: s.id,
+      tournament: tournamentName,
+      progress: ((filteredSeries.indexOf(s) + 1) / filteredSeries.length * 100).toFixed(1),
+    });
+
+    // Fetch draft data
+    const seriesState = await grid.fetchSeriesDraftData(s.id);
+    if (!seriesState || !seriesState.games) {
+      console.log(`[Grid] No games for series ${s.id}, skipping`);
+      continue;
+    }
+
+    // Determine which team is "us" and which is opponent
+    const ourTeamOnGrid = s.teams?.find(t => t.baseInfo?.id === team.gridTeamId);
+    const opponentTeam = s.teams?.find(t => t.baseInfo?.id !== team.gridTeamId);
+    const opponentName = opponentTeam?.baseInfo?.name || "Unknown";
+
+    for (const game of seriesState.games) {
+      if (!game.draftActions || game.draftActions.length === 0) continue;
+
+      // Parse draft actions
+      const events = grid.parseDraftActions([game]);
+
+      // Separate picks/bans by side
+      const bluePicks = events.filter(e => e.side === 'blue' && e.action_type === 'pick').map(e => e.champion_name);
+      const redPicks = events.filter(e => e.side === 'red' && e.action_type === 'pick').map(e => e.champion_name);
+      const blueBans = events.filter(e => e.side === 'blue' && e.action_type === 'ban').map(e => e.champion_name);
+      const redBans = events.filter(e => e.side === 'red' && e.action_type === 'ban').map(e => e.champion_name);
+
+      // Determine which side our team is on
+      const ourTeam = game.teams?.find(t => t.id === team.gridTeamId);
+      const ourSide = ourTeam?.side?.toLowerCase() || null;
+      const won = ourTeam?.won ? 1 : 0;
+
+      // Build picks/bans from our team's perspective
+      const ourPicks = ourSide === 'blue' ? bluePicks : ourSide === 'red' ? redPicks : [];
+      const ourBans = ourSide === 'blue' ? blueBans : ourSide === 'red' ? redBans : [];
+      const oppPicks = ourSide === 'blue' ? redPicks : ourSide === 'red' ? bluePicks : [];
+      const oppBans = ourSide === 'blue' ? redBans : ourSide === 'red' ? blueBans : [];
+
+      // Build draft sequence JSON
+      const draftSequence = JSON.stringify(events.map(e => ({
+        game: e.game_sequence,
+        side: e.side,
+        type: e.action_type,
+        champion: e.champion_name,
+        pos: e.pick_position || e.ban_position,
+      })));
+
+      // Determine winner side
+      let winnerSide = null;
+      for (const t of game.teams || []) {
+        if (t.won) { winnerSide = t.side?.toLowerCase(); break; }
+      }
+
+      // Insert into team_games
+      const gameDate = s.startTimeScheduled ? s.startTimeScheduled.split('T')[0] : new Date().toISOString().split('T')[0];
+      try {
+        await turso.execute({
+          sql: `INSERT OR IGNORE INTO team_games 
+                (team_id, workspace_id, tournament, game_date, opponent, win, picks, bans, opp_picks, opp_bans, source, source_game_id,
+                 blue_picks, red_picks, blue_bans, red_bans, blue_team, red_team, draft_sequence, game_number, grid_series_id, grid_game_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'grid', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: [
+            team.teamId,
+            WORKSPACE_ID,
+            tournamentName || s.tournament?.name || "Unknown",
+            gameDate,
+            opponentName,
+            won,
+            JSON.stringify(ourPicks),
+            JSON.stringify(ourBans),
+            JSON.stringify(oppPicks),
+            JSON.stringify(oppBans),
+            String(s.id), // source_game_id
+            JSON.stringify(bluePicks),
+            JSON.stringify(redPicks),
+            JSON.stringify(blueBans),
+            JSON.stringify(redBans),
+            s.teams?.[0]?.baseInfo?.name || null,
+            s.teams?.[1]?.baseInfo?.name || null,
+            draftSequence,
+            game.sequenceNumber,
+            String(s.id),
+            game.id,
+          ],
+        });
+        importedGames++;
+      } catch (err) {
+        if (!err.message.includes("UNIQUE"))
+          console.warn(`[Grid] team_games insert error: ${err.message}`);
+      }
+
+      // Download Riot summary file for participant data
+      await sleep(1500);
+      const summaryData = await grid.downloadRiotFile(s.id, game.sequenceNumber, 'summary');
+      if (!summaryData || !summaryData.participants) continue;
+
+      const participants = grid.parseRiotSummaryFile(summaryData);
+
+      // Try to match participants to stored players by name
+      const players = JSON.parse(PLAYERS_JSON);
+      for (const p of participants) {
+        // Find matching player by checking if their name appears in the participant's riotIdGameName
+        const matchedPlayer = players.find(pl => {
+          if (!p.playerName) return false;
+          const nameLower = p.playerName.toLowerCase();
+          return nameLower.includes(pl.riotId?.toLowerCase() || '') ||
+                 (pl.gridPlayerId && p.playerName.toLowerCase().includes(pl.name?.toLowerCase() || ''));
+        });
+
+        if (matchedPlayer) {
+          // Insert into competitive_games for this player
+          try {
+            await turso.execute({
+              sql: `INSERT OR IGNORE INTO competitive_games 
+                    (player_id, workspace_id, source, source_game_id, game_date, champion, opponent_champion, tournament, opponent, win, kills, deaths, assists, cs, gold, side, role, duration)
+                    VALUES (?, ?, 'grid', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              args: [
+                matchedPlayer.playerId,
+                WORKSPACE_ID,
+                `${s.id}_g${game.sequenceNumber}_p${p.participantId}`, // source_game_id
+                gameDate,
+                p.championName,
+                null, // opponent_champion — not easily determined from summary alone
+                tournamentName || s.tournament?.name || "Unknown",
+                opponentName,
+                p.win,
+                p.kills,
+                p.deaths,
+                p.assists,
+                p.cs,
+                p.goldEarned,
+                p.side,
+                p.role,
+                summaryData.gameDuration ? Math.round(summaryData.gameDuration) : null,
+              ],
+            });
+            importedPlayers++;
+          } catch (err) {
+            if (!err.message.includes("UNIQUE"))
+              console.warn(`[Grid] competitive_games insert error: ${err.message}`);
+          }
+        }
+      }
+    }
+
+    await sleep(1000); // Rate limiting between series
+  }
+
+  console.log(`[Grid] Imported ${importedGames} team games, ${importedPlayers} player game entries`);
+  await reportProgress({
+    step: "grid",
+    status: "completed",
+    totalImported: importedGames,
+    totalPlayerEntries: importedPlayers,
+  });
+
+  return { importedGames, importedPlayers };
 }
 
 // ─── Step 5: Post-import aggregation ─────────────────────────────────

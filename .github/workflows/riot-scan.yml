@@ -48,6 +48,7 @@ jobs:
         run: node scripts/run-scan.cjs
         env:
           RIOT_API_KEY: ${{ secrets.RIOT_API_KEY }}
+          GRID_API_KEY: ${{ secrets.GRID_API_KEY }}
           TURSO_SCOUTING_URL: ${{ secrets.TURSO_SCOUTING_URL }}
           TURSO_SCOUTING_TOKEN: ${{ secrets.TURSO_SCOUTING_TOKEN }}
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
