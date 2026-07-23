@@ -545,7 +545,7 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
     };
     const role = roleMap[(p.teamPosition || "").toUpperCase()] || null;
 
-    if (assignedRole && role !== assignedRole) {
+    if (assignedRole && role?.toLowerCase() !== assignedRole.toLowerCase()) {
       continue;
     }
     gamesMatched++;
@@ -852,7 +852,7 @@ async function importTeamData(turso, team, tournamentName) {
   try {
     await turso.execute({
       sql: `INSERT OR IGNORE INTO team_games (team_id, workspace_id, tournament, game_date, opponent, win, picks, bans, opp_picks, opp_bans, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'gridgg')`,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'grid')`,
       args: [
         team.teamId,
         WORKSPACE_ID,
