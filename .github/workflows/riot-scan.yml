@@ -14,7 +14,7 @@ on:
         required: false
         default: 'fresh'
       players:
-        description: 'JSON array of { playerId, riotId, tag, region, leaguepediaUrl, playerOverrideName }'
+        description: 'JSON array of { playerId, riotId, tag, region, puuid, leaguepediaUrl, leaguepediaSlug, playerOverrideName, assignedRole }'
         required: true
       options:
         description: 'JSON: { doSoloq, soloqMethod (opgg|riot-api), doCompetitive, doTeam, dataRange: {type, startDate?, endDate?} }'

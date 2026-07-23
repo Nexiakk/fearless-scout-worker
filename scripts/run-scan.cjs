@@ -26,6 +26,15 @@
 const { createClient } = require('@libsql/client');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const { ChampionNameMapper } = require('./champion-name-mapper.cjs');
+
+// ─── Force stdout/stderr flushing for live GitHub Actions logs ─────────
+if (process.stdout._handle && process.stdout._handle.setBlocking) {
+  process.stdout._handle.setBlocking(true);
+}
+if (process.stderr._handle && process.stderr._handle.setBlocking) {
+  process.stderr._handle.setBlocking(true);
+}
 
 // ─── Config from env ──────────────────────────────────────────────────
 const RIOT_API_KEY = process.env.RIOT_API_KEY || '';
@@ -63,20 +72,21 @@ function regionToRouting(region) {
   return routing[region] || 'europe';
 }
 
+// Global champion name mapper — initialized at startup via Data Dragon API
+// Replaces old hardcoded normalizeChampionName() approach.
+// Handles all name variants dynamically.
+let championMapper = null;
+
+/**
+ * Normalize a champion name to canonical display name using the dynamic mapper.
+ * Falls back to returning the original name if mapper not initialized.
+ */
 function normalizeChampionName(name) {
   if (!name) return name;
-  const nameMap = {
-    MonkeyKing: 'Wukong', DrMundo: 'Dr. Mundo', 'Dr Mundo': 'Dr. Mundo',
-    JarvanIV: 'Jarvan IV', MasterYi: 'Master Yi', MissFortune: 'Miss Fortune',
-    TahmKench: 'Tahm Kench', TwistedFate: 'Twisted Fate', XinZhao: 'Xin Zhao',
-    AurelionSol: 'Aurelion Sol', KogMaw: "Kog'Maw", RekSai: "Rek'Sai",
-    KSante: "K'Sante", BelVeth: "Bel'Veth",
-  };
-  const lower = name.toLowerCase();
-  for (const [k, v] of Object.entries(nameMap)) {
-    if (k.toLowerCase() === lower) return v;
-  }
-  return name;
+  if (!championMapper || !championMapper.isInitialized()) return name;
+  const championId = championMapper.toChampionId(name);
+  // Get display name if we have it, otherwise return the normalized ID
+  return championMapper.getDisplayName(championId) || championId;
 }
 
 // ─── Progress reporting ───────────────────────────────────────────────
@@ -145,7 +155,7 @@ async function hasTeamData(turso, teamId, tournament) {
 
 async function scrapeOpgg(turso, player, options) {
   const { playerId, riotId, tag, region } = player;
-  console.log(`[op.gg] Scraping: ${riotId}#${tag}`);
+  console.log(`::notice::[op.gg] Scraping: ${riotId}#${tag}`);
 
   // Check resume
   if (await hasPlayerSoloqData(turso, playerId)) {
@@ -198,21 +208,19 @@ async function scrapeOpgg(turso, player, options) {
         avgAssists = champ.kda.assists || champ.kda.a || null;
       }
 
-      // Store each game individually so the data is consistent with Riot API format
+      // Store each game individually
       for (let g = 0; g < games; g++) {
         try {
-          // For op.gg aggregate data we don't have per-game dates, so INSERT OR IGNORE
-          // uses a placeholder row that gets replaced if Riot API data comes later
           await turso.execute({
             sql: `INSERT INTO soloq_games (player_id, workspace_id, source, game_date, champion, kills, deaths, assists, gold, cs, win, role)
                   VALUES (?, ?, 'opgg', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
             args: [
               playerId, WORKSPACE_ID,
-              new Date().toISOString().split('T')[0], // approximate date
+              new Date().toISOString().split('T')[0],
               name,
               Math.round(avgKills || 0), Math.round(avgDeaths || 0), Math.round(avgAssists || 0),
               Math.round(avgGold || 0), Math.round(avgCs || 0),
-              wins / games > 0.5 ? 1 : 0, // approximate win
+              wins / games > 0.5 ? 1 : 0,
             ],
           });
         } catch (err) {
@@ -256,16 +264,12 @@ async function riotFetch(url) {
 
 /**
  * Find the opponent champion from match data.
- * Looks for the enemy player in the same teamPosition (role) on the opposite team.
  */
 function findOpponentChampion(matchParticipants, puuid) {
   const player = matchParticipants.find(p => p.puuid === puuid);
   if (!player) return null;
-
-  const teamId = player.teamId; // 100 or 200
+  const teamId = player.teamId;
   const position = (player.teamPosition || '').toUpperCase();
-
-  // Riot API: same teamPosition on the opposite team = lane opponent
   const enemy = matchParticipants.find(
     p => p.teamId !== teamId && p.teamPosition === position
   );
@@ -273,7 +277,7 @@ function findOpponentChampion(matchParticipants, puuid) {
 }
 
 async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
-  const { playerId, riotId, tag, region, assignedRole } = player;
+  const { playerId, riotId, tag, region, assignedRole, puuid: storedPuuid } = player;
   console.log(`[RiotAPI] Scanning: ${riotId}#${tag} (role filter: ${assignedRole || 'none'})`);
 
   if (await hasPlayerSoloqData(turso, playerId)) {
@@ -282,13 +286,20 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
   }
 
   const routing = regionToRouting(region);
-  const puuidUrl = `https://${routing}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(riotId)}/${encodeURIComponent(tag)}`;
-  const accountData = await riotFetch(puuidUrl);
-  if (!accountData?.puuid) {
-    console.error(`[RiotAPI] Could not resolve PUUID for ${riotId}#${tag}`);
-    return { gamesFound: 0, gamesImported: 0 };
+  let puuid;
+  if (storedPuuid) {
+    console.log(`[RiotAPI] Using stored PUUID for ${riotId}#${tag} (skipped API resolve)`);
+    puuid = storedPuuid;
+  } else {
+    console.log(`[RiotAPI] No stored PUUID for ${riotId}#${tag} — resolving from Riot API`);
+    const puuidUrl = `https://${routing}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(riotId)}/${encodeURIComponent(tag)}`;
+    const accountData = await riotFetch(puuidUrl);
+    if (!accountData?.puuid) {
+      console.error(`[RiotAPI] Could not resolve PUUID for ${riotId}#${tag}`);
+      return { gamesFound: 0, gamesImported: 0 };
+    }
+    puuid = accountData.puuid;
   }
-  const puuid = accountData.puuid;
 
   const params = new URLSearchParams({ api_key: RIOT_API_KEY, count: '100', queue: '420' });
   if (startTimestamp) params.set('startTime', startTimestamp);
@@ -312,13 +323,9 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
     const roleMap = { TOP: 'Top', JUNGLE: 'Jungle', MIDDLE: 'Mid', BOTTOM: 'Bot', UTILITY: 'Support', SUPPORT: 'Support' };
     const role = roleMap[(p.teamPosition || '').toUpperCase()] || null;
 
-    // Role filtering: skip if this game was played on a different role than assigned
-    if (assignedRole && role !== assignedRole) {
-      continue;
-    }
+    if (assignedRole && role !== assignedRole) { continue; }
     gamesMatched++;
 
-    // Opponent detection: find enemy champion in same role/position
     const opponentChampion = findOpponentChampion(matchData.info.participants, puuid);
     const gameDate = new Date(matchData.info.gameCreation).toISOString().split('T')[0];
 
@@ -362,125 +369,140 @@ async function fetchLeaguepediaCargo(params) {
   return null;
 }
 
-/**
- * Resolve opponent champion from ScoreboardGames for a specific game.
- * Fetches the enemy player in the same role on the opposite team.
- */
-async function resolveCompOpponent(turso, gameId, playerTeam, role) {
-  if (!gameId || !role) return null;
-  try {
-    const data = await fetchLeaguepediaCargo({
-      tables: 'ScoreboardGames',
-      fields: 'Champion',
-      where: `GameId = "${gameId}" AND Team != "${playerTeam}" AND Role = "${role}"`,
-      limit: '1',
-      format: 'json',
-    });
-    if (data) {
-      let rows = [];
-      if (typeof data === 'string') { try { rows = JSON.parse(data); } catch { return null; } }
-      else if (Array.isArray(data)) { rows = data; }
-      else if (data?.response) { rows = data.response; }
-      if (rows.length > 0) {
-        return normalizeChampionName(rows[0].Champion || rows[0].champion || '');
-      }
-    }
-  } catch {
-    // Silently fail — opponent is optional
-  }
-  return null;
-}
-
 async function scanCompetitive(turso, player) {
-  const { playerId, riotId, tag, playerOverrideName, leaguepediaUrl } = player;
-  const lpName = playerOverrideName || (leaguepediaUrl ? decodeURIComponent(leaguepediaUrl.match(/wiki\/([^/?]+)/)?.[1] || '') : riotId);
-  console.log(`[Competitive] Scanning: ${lpName}`);
+  const { playerId, riotId, tag, playerOverrideName, leaguepediaUrl, leaguepediaSlug } = player;
+  const lpName = leaguepediaSlug || playerOverrideName || 
+    (leaguepediaUrl ? decodeURIComponent(leaguepediaUrl.match(/wiki\/([^/?]+)/)?.[1] || '') : riotId);
+  
+  console.log(`::notice::[Competitive] Scanning player: ${lpName} (playerId: ${playerId})`);
 
   if (await hasPlayerCompData(turso, playerId)) {
     console.log(`[Competitive] ${lpName} already has data, skipping`);
     return { gamesImported: 0, skipped: true };
   }
 
-  // Fetch per-game data from ScoreboardGames (real dates, KDA, opponent, role)
+  // 3-Table Join: SP (player), SPVs (lane opponent via UniqueRoleVs), SG (game metadata)
+  // SPVs.Champion=ChampionVs — alias to avoid field collision with SP.Champion
+  // SPVs.Team=TeamVs — alias to get opponent team name
+  // SP.IngameRole=Role — alias for clarity
+  // SG.Gamelength — game duration in "MM:SS" format
   const data = await fetchLeaguepediaCargo({
-    tables: 'ScoreboardGames',
-    fields: 'GameId, Champion, Team, Side, Kills, Deaths, Assists, Win, DateTime_UTC, Tournament, Role',
-    where: `Player = "${lpName}"`,
+    tables: 'ScoreboardPlayers=SP,ScoreboardPlayers=SPVs,ScoreboardGames=SG',
+    fields: [
+      'SP.GameId',
+      'SP.Champion',
+      'SPVs.Champion=ChampionVs',
+      'SP.Link',
+      'SP.Side',
+      'SP.Team',
+      'SPVs.Team=TeamVs',
+      'SP.IngameRole=Role',
+      'SG.Tournament',
+      'SP.Kills',
+      'SP.Deaths',
+      'SP.Assists',
+      'SP.CS',
+      'SP.Gold',
+      'SG.DateTime_UTC',
+      'SG.Winner',
+      'SG.Team1',
+      'SG.Team2',
+      'SP.DamageToChampions',
+      'SG.Gamelength',
+    ].join(','),
+    where: `SP.Link = "${lpName}"`,
+    join_on: 'SG.GameId=SP.GameId,SP.UniqueRoleVs=SPVs.UniqueRole',
     limit: '500',
     format: 'json',
-    order_by: 'DateTime_UTC DESC',
+    order_by: 'SG.DateTime_UTC DESC',
   });
 
   if (!data) {
     console.log(`[Competitive] No data from Leaguepedia for ${lpName}`);
-    return { gamesImported: 0 };
+    console.log(`[Competitive] Debug — empty response for query Player = "${lpName}"`);
+    return { gamesImported: 0, needsFallback: true, fallbackName: riotId };
   }
 
-  // Parse JSON response
   let rows = [];
   if (typeof data === 'string') {
-    try { rows = JSON.parse(data); } catch { return { gamesImported: 0 }; }
-  } else if (Array.isArray(data)) {
-    rows = data;
-  } else if (data?.response) {
-    rows = data.response;
+    try { rows = JSON.parse(data); } catch { 
+      console.warn(`[Competitive] Failed to parse JSON response: ${data.substring(0, 200)}`);
+      return { gamesImported: 0 }; 
+    }
+  } else if (Array.isArray(data)) { rows = data; }
+  else if (data?.response) { rows = data.response; }
+
+  if (rows.length > 0) {
+    console.log(`[Competitive] Raw response sample (first 3 rows):`, rows.slice(0, 3).map(r => JSON.stringify(r)));
   }
 
   if (!Array.isArray(rows) || rows.length === 0) {
     console.log(`[Competitive] No rows for ${lpName}`);
-    return { gamesImported: 0 };
+    console.log(`::notice::[Competitive] Zero results — check if Leaguepedia slug "${lpName}" is correct`);
+    return { gamesImported: 0, needsFallback: true, fallbackName: riotId };
   }
 
-  // Collect unique GameIds for batch opponent resolution
-  const gameIdToOpponent = {};
+  console.log(`::notice::[Competitive] Found ${rows.length} competitive games for ${lpName}`);
 
   let totalImported = 0;
+
   for (const row of rows) {
     const champion = normalizeChampionName(row.Champion || row.champion || '');
     if (!champion) continue;
 
     const gameId = row.GameId || row.gameId || '';
     const team = row.Team || row.team || '';
-    const side = row.Side || row.side || '';
-    const role = row.Role || row.role || '';
+    const side = parseInt(row.Side || row.side || 0);
     const tournament = row.Tournament || row.tournament || 'Pro Play';
-    const win = row.Win === true || row.Win === 1 || row.win === true || row.win === 1 ? 1 : 0;
+    // Winner=1 means Team1 won, Winner=2 means Team2 won.
+    // Side=1 means player on Team1, Side=2 means player on Team2.
+    const winner = parseInt(row.Winner || row.winner || 0);
+    const win = (side && winner && side === winner) ? 1 : 0;
     const kills = parseInt(row.Kills || row.kills || 0);
     const deaths = parseInt(row.Deaths || row.deaths || 0);
     const assists = parseInt(row.Assists || row.assists || 0);
-    const gameDate = row.DateTime_UTC || row.date || new Date().toISOString().split('T')[0];
-
-    // Map Leaguepedia roles to standard format
-    const roleMap = {
-      'Top': 'Top', 'Top Laner': 'Top',
-      'Jungle': 'Jungle', 'Jungler': 'Jungle',
-      'Mid': 'Mid', 'Middle': 'Mid', 'Mid Laner': 'Mid',
-      'Bot': 'Bot', 'ADC': 'Bot', 'Bottom': 'Bot', 'Bot Laner': 'Bot',
-      'Support': 'Support', 'Utility': 'Support',
-    };
-    const mappedRole = roleMap[role] || role || null;
-
-    // Resolve opponent champion (lazy once per GameId)
-    let opponentChampion = null;
-    if (gameId && team && mappedRole) {
-      if (!gameIdToOpponent[gameId]) {
-        gameIdToOpponent[gameId] = await resolveCompOpponent(turso, gameId, team, role);
-        await sleep(100); // rate limit
+    // DateTime_UTC comes back as "DateTime UTC" (space) from CargoExport
+    const gameDate = row['DateTime UTC'] || row.DateTime_UTC || row.date || new Date().toISOString().split('T')[0];
+    // New fields from expanded 3-table join
+    const cs = parseInt(row.CS || row.cs || 0);
+    const gold = parseInt(row.Gold || row.gold || 0);
+    const damage = parseInt(row.DamageToChampions || row.damageToChampions || 0);
+    // Gamelength comes as "MM:SS" string — parse to seconds for storage
+    const gamelengthStr = row.Gamelength || row.gamelength || '';
+    let duration = 0;
+    if (gamelengthStr) {
+      const parts = gamelengthStr.split(':');
+      if (parts.length === 2) {
+        duration = parseInt(parts[0]) * 60 + parseInt(parts[1]);
       }
-      opponentChampion = gameIdToOpponent[gameId];
     }
+    
+    // Derive side label and opponent team from Team1/Team2.
+    // SG.Team1 = team on Blue side, SG.Team2 = team on Red side.
+    // SP.Side = 1 means player is on Blue (Team1), 2 means player is on Red (Team2).
+    const team1Name = row.Team1 || row.team1 || '';
+    const team2Name = row.Team2 || row.team2 || '';
+    const sideLabel = side === 1 ? 'Blue' : (side === 2 ? 'Red' : '');
+    const opponent = row.TeamVs || (side === 1 ? team2Name : (side === 2 ? team1Name : ''));
+
+    // Role is now available from the 3-table join via SP.IngameRole=Role alias
+    const mappedRole = row.Role || row.role || null;
+
+    // Opponent champion from the SPVs self-join via SPVs.Champion=ChampionVs alias
+    const opponentChampion = normalizeChampionName(row.ChampionVs || row.championVs || '');
 
     try {
       await turso.execute({
         sql: `INSERT OR IGNORE INTO competitive_games 
-              (player_id, workspace_id, leaguepedia_game_id, game_date, champion, opponent_champion, tournament, opponent, win, kills, deaths, assists, side, role)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              (player_id, workspace_id, leaguepedia_game_id, game_date, champion, opponent_champion, tournament, opponent, team, win, kills, deaths, assists, cs, gold, vision, damage, duration, side, role)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           playerId, WORKSPACE_ID, gameId,
           gameDate, champion, opponentChampion,
-          tournament, '', win,
+          tournament, opponent, team, win,
           kills, deaths, assists,
-          side, mappedRole,
+          cs, gold, 0, damage,
+          duration, sideLabel, mappedRole,
         ],
       });
       totalImported++;
@@ -510,12 +532,7 @@ async function importTeamData(turso, team, tournamentName) {
     return { importedGames: 0, skipped: true };
   }
 
-  // Try Grid.gg data first via the main repo's teamImport function
-  // Since we're in the worker, we call the callback URL as a fallback
-  // For Grid.gg, we import from the LPL games table if available
   let importedGames = 0;
-
-  // Store a placeholder in team_games
   try {
     await turso.execute({
       sql: `INSERT OR IGNORE INTO team_games (team_id, workspace_id, tournament, game_date, opponent, win, picks, bans, opp_picks, opp_bans, source)
@@ -532,128 +549,11 @@ async function importTeamData(turso, team, tournamentName) {
 
 // ─── Step 5: Post-import aggregation ─────────────────────────────────
 
-/**
- * Compute champion_stats and champion_matchups from raw game data.
- * Runs after all imports to ensure aggregates are up-to-date.
- */
 async function computeAggregates(turso, playerIds) {
-  console.log('\n=== Step 5: Computing Aggregates ===');
-  await reportProgress({ step: 'aggregation', status: 'started' });
-
-  // Clear existing aggregates for these players to avoid stale data
-  for (const playerId of playerIds) {
-    // Delete old soloq champion_stats for this player
-    await turso.execute({
-      sql: `DELETE FROM champion_stats WHERE player_id = ? AND workspace_id = ? AND source = 'soloq'`,
-      args: [playerId, WORKSPACE_ID],
-    });
-
-    // Delete old competitive champion_stats
-    await turso.execute({
-      sql: `DELETE FROM champion_stats WHERE player_id = ? AND workspace_id = ? AND source = 'competitive'`,
-      args: [playerId, WORKSPACE_ID],
-    });
-
-    // Delete old matchups
-    await turso.execute({
-      sql: `DELETE FROM champion_matchups WHERE player_id = ? AND workspace_id = ?`,
-      args: [playerId, WORKSPACE_ID],
-    });
-  }
-
-  // Rebuild champion_stats from soloq_games
-  await turso.execute({
-    sql: `INSERT INTO champion_stats
-          (player_id, workspace_id, champion, source, role, role_key,
-           games, wins, losses, winrate,
-           avg_kills, avg_deaths, avg_assists, avg_gold, avg_cs,
-           first_seen, last_seen, computed_at)
-          SELECT
-            player_id, workspace_id, champion, 'soloq',
-            role, COALESCE(role, 'unknown'),
-            COUNT(*) as games,
-            SUM(CASE WHEN win = 1 THEN 1 ELSE 0 END) as wins,
-            SUM(CASE WHEN win = 0 THEN 1 ELSE 0 END) as losses,
-            AVG(CASE WHEN win = 1 THEN 100.0 ELSE 0 END) as winrate,
-            AVG(kills), AVG(deaths), AVG(assists), AVG(gold), AVG(cs),
-            MIN(game_date), MAX(game_date), datetime('now')
-          FROM soloq_games
-          WHERE workspace_id = ? AND player_id IN (${playerIds.map(() => '?').join(',')})
-          GROUP BY player_id, workspace_id, champion, role`,
-    args: [WORKSPACE_ID, ...playerIds],
-  });
-
-  // Rebuild champion_stats from competitive_games
-  await turso.execute({
-    sql: `INSERT INTO champion_stats
-          (player_id, workspace_id, champion, source, role, role_key,
-           games, wins, losses, winrate,
-           avg_kills, avg_deaths, avg_assists, avg_gold, avg_cs,
-           first_seen, last_seen, computed_at)
-          SELECT
-            player_id, workspace_id, champion, 'competitive',
-            role, COALESCE(role, 'unknown'),
-            COUNT(*) as games,
-            SUM(CASE WHEN win = 1 THEN 1 ELSE 0 END) as wins,
-            SUM(CASE WHEN win = 0 THEN 1 ELSE 0 END) as losses,
-            AVG(CASE WHEN win = 1 THEN 100.0 ELSE 0 END) as winrate,
-            AVG(kills), AVG(deaths), AVG(assists), AVG(gold), AVG(cs),
-            MIN(game_date), MAX(game_date), datetime('now')
-          FROM competitive_games
-          WHERE workspace_id = ? AND player_id IN (${playerIds.map(() => '?').join(',')})
-          GROUP BY player_id, workspace_id, champion, role`,
-    args: [WORKSPACE_ID, ...playerIds],
-  });
-
-  // Rebuild champion_matchups from soloq_games
-  await turso.execute({
-    sql: `INSERT INTO champion_matchups
-          (player_id, workspace_id, champion, opponent_champion, source, role_key,
-           games, wins, losses, winrate,
-           avg_kills, avg_deaths, avg_assists,
-           first_seen, last_seen, computed_at)
-          SELECT
-            player_id, workspace_id, champion, opponent_champion, 'soloq',
-            COALESCE(role, 'unknown'),
-            COUNT(*) as games,
-            SUM(CASE WHEN win = 1 THEN 1 ELSE 0 END) as wins,
-            SUM(CASE WHEN win = 0 THEN 1 ELSE 0 END) as losses,
-            AVG(CASE WHEN win = 1 THEN 100.0 ELSE 0 END) as winrate,
-            AVG(kills), AVG(deaths), AVG(assists),
-            MIN(game_date), MAX(game_date), datetime('now')
-          FROM soloq_games
-          WHERE workspace_id = ? AND player_id IN (${playerIds.map(() => '?').join(',')})
-            AND opponent_champion IS NOT NULL
-          GROUP BY player_id, workspace_id, champion, opponent_champion, role`,
-    args: [WORKSPACE_ID, ...playerIds],
-  });
-
-  // Rebuild champion_matchups from competitive_games
-  await turso.execute({
-    sql: `INSERT INTO champion_matchups
-          (player_id, workspace_id, champion, opponent_champion, source, role_key,
-           games, wins, losses, winrate,
-           avg_kills, avg_deaths, avg_assists,
-           first_seen, last_seen, computed_at)
-          SELECT
-            player_id, workspace_id, champion, opponent_champion, 'competitive',
-            COALESCE(role, 'unknown'),
-            COUNT(*) as games,
-            SUM(CASE WHEN win = 1 THEN 1 ELSE 0 END) as wins,
-            SUM(CASE WHEN win = 0 THEN 1 ELSE 0 END) as losses,
-            AVG(CASE WHEN win = 1 THEN 100.0 ELSE 0 END) as winrate,
-            AVG(kills), AVG(deaths), AVG(assists),
-            MIN(game_date), MAX(game_date), datetime('now')
-          FROM competitive_games
-          WHERE workspace_id = ? AND player_id IN (${playerIds.map(() => '?').join(',')})
-            AND opponent_champion IS NOT NULL
-          GROUP BY player_id, workspace_id, champion, opponent_champion, role`,
-    args: [WORKSPACE_ID, ...playerIds],
-  });
-
-  await logStep(turso, 'aggregation', 0);
-  console.log('[Aggregation] Complete');
-  await reportProgress({ step: 'aggregation', status: 'completed' });
+  // Deprecated — precomputed tables removed in schema v2.
+  // Raw-data queries used instead.
+  console.log('[Aggregation] Skipped — using raw-data query architecture');
+  await reportProgress({ step: 'aggregation', status: 'skipped' });
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────
@@ -661,6 +561,18 @@ async function computeAggregates(turso, playerIds) {
 async function main() {
   console.log('=== Full Scouting Scan (GitHub Actions) ===');
   console.log(`Job ID: ${JOB_ID}, Workspace: ${WORKSPACE_ID}, Mode: ${MODE}`);
+
+  // Initialize champion name mapper from Data Dragon
+  console.log('::group::Initializing Champion Name Mapper');
+  championMapper = new ChampionNameMapper();
+  try {
+    await championMapper.initialize();
+    console.log(`::notice::Champion name mapper initialized successfully`);
+  } catch (error) {
+    console.warn(`[Warning] Could not initialize champion name mapper: ${error.message}`);
+    console.warn(`[Warning] Falling back to passthrough name normalization`);
+  }
+  console.log('::endgroup::');
 
   const players = JSON.parse(PLAYERS_JSON);
   const options = JSON.parse(OPTIONS_JSON);
@@ -674,7 +586,6 @@ async function main() {
   const turso = createClient({ url: TURSO_URL, authToken: TURSO_TOKEN });
   console.log(`Connected to Turso, ${players.length} players`);
 
-  // Convert dates
   const dataRange = options.dataRange || {};
   const startTimestamp = dataRange.startDate ? Math.floor(new Date(dataRange.startDate).getTime() / 1000) : null;
   const endTimestamp = dataRange.endDate ? Math.floor(new Date(dataRange.endDate).getTime() / 1000) : null;
@@ -682,6 +593,7 @@ async function main() {
   await reportProgress({ status: 'started', totalPlayers: players.length });
 
   // ── Step 1: op.gg SoloQ ─────────────────────────────────────────
+  console.log('::group::Step 1: op.gg SoloQ Scraping');
   if (options.doSoloq && options.soloqMethod === 'opgg') {
     if (!await isStepComplete(turso, 'soloq_opgg')) {
       console.log('\n=== Step 1: op.gg SoloQ ===');
@@ -703,6 +615,8 @@ async function main() {
   }
 
   // ── Step 2: Riot API SoloQ ───────────────────────────────────────
+  console.log('::endgroup::');
+  console.log('::group::Step 2: Riot API SoloQ');
   if (options.doSoloq && options.soloqMethod === 'riot-api') {
     if (!await isStepComplete(turso, 'soloq_riot_api')) {
       console.log('\n=== Step 2: Riot API SoloQ ===');
@@ -728,6 +642,8 @@ async function main() {
   }
 
   // ── Step 3: Leaguepedia Competitive ──────────────────────────────
+  console.log('::endgroup::');
+  console.log('::group::Step 3: Leaguepedia Competitive');
   if (options.doCompetitive) {
     if (!await isStepComplete(turso, 'competitive')) {
       console.log('\n=== Step 3: Leaguepedia Competitive ===');
@@ -736,8 +652,19 @@ async function main() {
       let totalImported = 0;
       for (let i = 0; i < players.length; i++) {
         await reportProgress({ step: 'competitive', currentPlayer: i + 1, totalPlayers: players.length, playerName: players[i].riotId });
-        const result = await scanCompetitive(turso, players[i]);
+        let result = await scanCompetitive(turso, players[i]);
+        
+        if (result.needsFallback && result.fallbackName) {
+          console.log(`[Competitive] Retrying with fallback name: ${result.fallbackName}`);
+          await sleep(1000);
+          const fallbackPlayer = { ...players[i], leaguepediaSlug: null, playerOverrideName: result.fallbackName };
+          result = await scanCompetitive(turso, fallbackPlayer);
+        }
+        
         totalImported += result.gamesImported || 0;
+        await logStep(turso, `competitive|${players[i].playerId}`, result.gamesImported || 0, 
+          result.error ? 'partial' : 'success', result.error || null);
+        
         await sleep(300);
       }
       await logStep(turso, 'competitive', totalImported);
@@ -748,6 +675,8 @@ async function main() {
   }
 
   // ── Step 4: Team Import ──────────────────────────────────────────
+  console.log('::endgroup::');
+  console.log('::group::Step 4: Team Import');
   if (options.doTeam && team.teamId && team.selectedTournaments?.length > 0) {
     if (!await isStepComplete(turso, 'team_import')) {
       console.log('\n=== Step 4: Team Import ===');
@@ -766,20 +695,21 @@ async function main() {
     }
   }
 
-  // ── Step 5: Compute Aggregates ────────────────────────────────
-  if (!await isStepComplete(turso, 'aggregation')) {
-    await computeAggregates(turso, players.map(p => p.playerId));
-  } else {
-    console.log('[Resume] Aggregation already complete, skipping');
-  }
+  // ── Step 5: Aggregation ──────────────────────────────────────────
+  console.log('::endgroup::');
+  console.log('::group::Step 5: Aggregation');
+  console.log('[Aggregation] Using raw-data query architecture — precomputed tables deprecated');
+  await reportProgress({ step: 'aggregation', status: 'completed' });
 
   // ── Done ─────────────────────────────────────────────────────────
   console.log('\n=== Scan Complete! ===');
+  console.log('::endgroup::');
   await reportProgress({ status: 'completed', completedAt: new Date().toISOString() });
 }
 
 main().catch(async (error) => {
   console.error('[Fatal]', error);
+  console.log('::endgroup::');
   await reportProgress({ status: 'failed', error: error.message }).catch(() => {});
   process.exit(1);
 });
