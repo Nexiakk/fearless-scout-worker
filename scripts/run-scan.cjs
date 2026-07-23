@@ -102,27 +102,136 @@ function normalizeChampionName(name) {
   return championMapper.getDisplayName(championId) || championId;
 }
 
+// ─── Stage label mapping ──────────────────────────────────────────────
+
+const STAGE_LABELS = {
+  opgg: { label: "op.gg SoloQ", icon: "🔍" },
+  "riot-api": { label: "Riot API SoloQ", icon: "⚔️" },
+  competitive: { label: "Leaguepedia Competitive", icon: "🏆" },
+  team: { label: "Team Import", icon: "👥" },
+  aggregation: { label: "Post-import Aggregation", icon: "📊" },
+};
+
+function getStageLabel(step) {
+  if (!step) return { label: "Starting scan...", icon: "🚀" };
+  const stage = STAGE_LABELS[step];
+  return stage || { label: step, icon: "🔄" };
+}
+
+function createHumanLabel(step, playerName, currentPlayer, totalPlayers) {
+  const stage = getStageLabel(step);
+  if (playerName) {
+    return `${stage.icon} ${stage.label}: ${playerName} (${currentPlayer || "?"}/${totalPlayers || "?"})`;
+  }
+  return `${stage.icon} ${stage.label}`;
+}
+
 // ─── Progress reporting ───────────────────────────────────────────────
 
+// Lazy-loaded Firestore client for progress writes
+let _firestoreDb = null;
+
+async function getFirestoreDb() {
+  if (_firestoreDb) return _firestoreDb;
+  try {
+    const { getFirestore } = require("./firebase-admin");
+    _firestoreDb = getFirestore();
+    return _firestoreDb;
+  } catch (err) {
+    console.warn(`[Firestore] Init failed (non-fatal): ${err.message}`);
+    return null;
+  }
+}
+
 async function reportProgress(progress) {
+  const step = progress.step || null;
+  const stage = getStageLabel(step);
+
+  // Build human-readable label
+  const stepLabel =
+    progress.stepLabel ||
+    createHumanLabel(
+      step,
+      progress.playerName,
+      progress.currentPlayer,
+      progress.totalPlayers,
+    );
+
+  // Build payload for callback
   const payload = {
     action: "scanProgress",
     jobId: JOB_ID,
     workspaceId: WORKSPACE_ID,
+    stepLabel,
     ...progress,
   };
-  if (!CALLBACK_URL) {
+
+  // Report to callback (Netlify scanProgress function)
+  if (CALLBACK_URL) {
+    try {
+      await fetch(CALLBACK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (error) {
+      console.warn(`[Progress] Callback failed: ${error.message}`);
+    }
+  } else {
     console.log(`[Progress] ${JSON.stringify(payload)}`);
-    return;
   }
+
+  // Also write progress to Firestore scoutJobs/{jobId}
   try {
-    await fetch(CALLBACK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    const db = await getFirestoreDb();
+    if (db) {
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000); // 7-day TTL
+
+      const status =
+        progress.status === "completed" || progress.status === "failed"
+          ? progress.status
+          : progress.status === "started"
+            ? "running"
+            : "running";
+
+      const docData = {
+        workspaceId: WORKSPACE_ID,
+        status,
+        step: step || "init",
+        stepLabel,
+        playerName: progress.playerName || null,
+        completed: progress.currentPlayer || 0,
+        total: progress.totalPlayers || 0,
+        message: stepLabel,
+        error: progress.error || null,
+        startedAt: progress.status === "started" ? now.toISOString() : null,
+        updatedAt: now.toISOString(),
+        expiresAt: expiresAt.toISOString(),
+      };
+
+      // Merge startedAt if doc already exists (preserve original startedAt)
+      if (progress.status !== "started") {
+        try {
+          const existing = await db.collection("scoutJobs").doc(JOB_ID).get();
+          if (existing.exists) {
+            const existingData = existing.data();
+            if (existingData.startedAt) {
+              docData.startedAt = existingData.startedAt;
+            }
+          }
+        } catch {
+          /* ignore read errors */
+        }
+      }
+
+      await db
+        .collection("scoutJobs")
+        .doc(JOB_ID)
+        .set(docData, { merge: true });
+    }
   } catch (error) {
-    console.warn(`[Progress] Report failed: ${error.message}`);
+    console.warn(`[Progress] Firestore write failed: ${error.message}`);
   }
 }
 
@@ -589,7 +698,7 @@ async function scanCompetitive(turso, player) {
     const gameId = row.GameId || "";
     const team = row.Team || "";
     const side = parseInt(row.Side || 0);
-    const tournament = row.Tournament || "Pro Play";
+    const tournament = row.Tournament || "Unknown Tournament";
     // Winner=1 means Team1 won, Winner=2 means Team2 won.
     // Side=1 means player on Team1, Side=2 means player on Team2.
     const winner = parseInt(row.Winner || 0);
