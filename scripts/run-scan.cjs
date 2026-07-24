@@ -111,6 +111,7 @@ const STAGE_LABELS = {
   team: { label: "Team Import", icon: "👥" },
   grid: { label: "Grid.gg Team Import", icon: "🏟️" },
   aggregation: { label: "Post-import Aggregation", icon: "📊" },
+  flags: { label: "Flag Computation", icon: "🚩" },
 };
 
 function getStageLabel(step) {
@@ -244,6 +245,27 @@ async function reportProgress(progress) {
     }
   } catch (error) {
     console.warn(`[Progress] Firestore write failed: ${error.message}`);
+  }
+}
+
+// ─── Firestore version marker ───────────────────────────────────────
+// Writes scoutingLastUpdated timestamp to _meta/scouting after scan
+// so the frontend can invalidate cached data via version check.
+async function writeScoutingVersionMarker() {
+  try {
+    const db = await getFirestoreDb();
+    if (!db) return;
+    await db
+      .collection('workspaces')
+      .doc(WORKSPACE_ID)
+      .collection('_meta')
+      .doc('scouting')
+      .set({
+        lastUpdated: new Date(),
+      }, { merge: true });
+    console.log(`[Version] Wrote scoutingLastUpdated marker for workspace ${WORKSPACE_ID}`);
+  } catch (err) {
+    console.warn(`[Version] Failed to write version marker: ${err.message}`);
   }
 }
 
@@ -1011,6 +1033,39 @@ async function importTeamDataFromGrid(turso, team, tournamentName) {
 
       const participants = grid.parseRiotSummaryFile(summaryData);
 
+      // Build role-ordered champions for each side (top→jungle→mid→bot→support)
+      const roleOrder = ['top', 'jungle', 'mid', 'bot', 'support'];
+      const blueParticipants = participants.filter(p => p.side === 'blue');
+      const redParticipants = participants.filter(p => p.side === 'red');
+      const blueRoles = roleOrder
+        .map(role => {
+          const p = blueParticipants.find(pp => pp.role === role);
+          return p ? { champion: p.championName, role: p.role } : null;
+        })
+        .filter(Boolean);
+      const redRoles = roleOrder
+        .map(role => {
+          const p = redParticipants.find(pp => pp.role === role);
+          return p ? { champion: p.championName, role: p.role } : null;
+        })
+        .filter(Boolean);
+
+      // Update team_games row with duration and role data
+      try {
+        await turso.execute({
+          sql: `UPDATE team_games SET duration = ?, blue_roles = ?, red_roles = ? WHERE grid_series_id = ? AND grid_game_id = ?`,
+          args: [
+            summaryData.gameDuration ? Math.round(summaryData.gameDuration) : null,
+            JSON.stringify(blueRoles),
+            JSON.stringify(redRoles),
+            String(s.id),
+            game.id,
+          ],
+        });
+      } catch (err) {
+        console.warn(`[Grid] team_games update error: ${err.message}`);
+      }
+
       // Try to match participants to stored players by name
       const players = JSON.parse(PLAYERS_JSON);
       for (const p of participants) {
@@ -1278,6 +1333,44 @@ async function main() {
   );
   await reportProgress({ step: "aggregation", status: "completed" });
 
+  // ── Step 6: Flag Computation ─────────────────────────────────────
+  console.log("::endgroup::");
+  if (options.doFlags !== false) {
+    console.log("::group::Step 6: Flag Computation");
+    try {
+      const { computePlayerFlags, savePlayerFlags, DEFAULT_THRESHOLDS } = require('./compute-flags.cjs');
+      const { getFirestore } = require('./firebase-admin');
+
+      // Load custom thresholds from Firestore
+      let thresholds = { ...DEFAULT_THRESHOLDS };
+      try {
+        const db = getFirestore();
+        const thresholdDoc = await db.collection('workspaces').doc(workspaceId)
+          .collection('_settings').doc('flagThresholds').get();
+        if (thresholdDoc.exists) {
+          thresholds = { ...DEFAULT_THRESHOLDS, ...thresholdDoc.data() };
+        }
+      } catch (err) {
+        console.warn(`[Flags] Could not load thresholds: ${err.message}, using defaults`);
+      }
+
+      // Compute single-player flags for each player
+      for (const player of players) {
+        const playerFlags = await computePlayerFlags(turso, player.playerId, player.name || player.riotId || 'Unknown', thresholds);
+        await savePlayerFlags(workspaceId, player.playerId, playerFlags);
+      }
+
+      console.log(`[Flags] Computed flags for ${players.length} players`);
+      await reportProgress({ step: "flags", status: "completed" });
+    } catch (err) {
+      console.error(`[Flags] Error computing flags: ${err.message}`);
+      totalErrorsAllSteps++;
+      await reportProgress({ step: "flags", status: "failed", error: err.message });
+    }
+  } else {
+    console.log("[Flags] Skipping flag computation (doFlags=false)");
+  }
+
   // ── Single import_log row for the entire run ─────────────────────
   await logStep(
     turso,
@@ -1293,6 +1386,11 @@ async function main() {
   await reportProgress({
     status: "completed",
     completedAt: new Date().toISOString(),
+  });
+
+  // Write version marker so frontend caches invalidate
+  await writeScoutingVersionMarker().catch(err => {
+    console.warn(`[Cleanup] Failed to write version marker: ${err.message}`);
   });
 
   // Release Firestore lock so other scans can proceed
