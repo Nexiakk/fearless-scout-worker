@@ -18,7 +18,7 @@
  *   WORKSPACE_ID       — Firestore workspace ID
  *   MODE               — "fresh" | "resume"
  *   PLAYERS_JSON       — JSON array of player objects
- *   OPTIONS_JSON       — JSON { doSoloq, soloqMethod, doCompetitive, doTeam, dataRange }
+ *   OPTIONS_JSON       — JSON { doSoloq, soloqMethod, doCompetitive, doTeam, dataRange, soloqDataRange }
  *   TEAM_JSON          — JSON { teamId, teamName, leaguepediaUrl, selectedTournaments }
  *   CALLBACK_URL       — Netlify function URL for progress reporting
  */
@@ -1512,8 +1512,15 @@ async function computeAggregates(turso, playerIds) {
  * The UI surfaces source provenance per row. There is NO cross-source
  * dedup at the row level; INSERT OR IGNORE handles within-source dedup.
  *
- * Default scope: last 12 months. User-configurable via
- * OPTIONS_JSON.dataRange.{startDate,endDate}.
+ * Scope windows (user preference 2026-08-02, supersedes the Sprint 5.3
+ * 12-month default):
+ *   - OPTIONS_JSON.dataRange       → Grid team import + Leaguepedia
+ *                                   competitive. No bounds = ALL TIME.
+ *   - OPTIONS_JSON.soloqDataRange  → Riot API SoloQ only. Falls back to
+ *                                   dataRange, then to the current season
+ *                                   (Jan 1 of this year).
+ * Presets resolve to concrete startDate/endDate client-side; the worker only
+ * understands bounds and { type: 'all-time' }.
  */
 
 async function main() {
@@ -1546,23 +1553,27 @@ async function main() {
   const turso = createClient({ url: TURSO_URL, authToken: TURSO_TOKEN });
   console.log(`Connected to Turso, ${players.length} players`);
 
-  // Default scope: last 12 months when startDate isn't provided (Sprint 5.3).
-  // Both Grid (via dataRange.startTimeGte/Lte) and LP (via the whereClause
-  // built in scanCompetitive) honour the same window.
+  // Scope windows (user preference 2026-08-02): Grid/Leaguepedia default to
+  // ALL TIME (no bounds); Riot API SoloQ defaults to the current season
+  // (Jan 1 of this year) and uses soloqDataRange (falling back to dataRange).
   const dataRange = options.dataRange || {};
-  if (!dataRange.startDate) {
-    dataRange.startDate = new Date(
-      Date.now() - 365 * 24 * 60 * 60 * 1000,
-    )
-      .toISOString()
-      .split("T")[0];
+  const soloqRange = options.soloqDataRange || dataRange || {};
+  const dataStart = dataRange.type === "all-time" ? null : dataRange.startDate || null;
+  const dataEnd = dataRange.endDate || null;
+  let soloqStart = soloqRange.type === "all-time" ? null : soloqRange.startDate || null;
+  let soloqEnd = soloqRange.endDate || null;
+  if (!soloqStart && !soloqEnd && soloqRange.type !== "all-time") {
+    soloqStart = `${new Date().getFullYear()}-01-01`;
   }
-  const startTimestamp = dataRange.startDate
-    ? Math.floor(new Date(dataRange.startDate).getTime() / 1000)
+  const startTimestamp = soloqStart
+    ? Math.floor(new Date(soloqStart).getTime() / 1000)
     : null;
-  const endTimestamp = dataRange.endDate
-    ? Math.floor(new Date(dataRange.endDate).getTime() / 1000)
+  const endTimestamp = soloqEnd
+    ? Math.floor(new Date(soloqEnd).getTime() / 1000)
     : null;
+  console.log(
+    `[Scope] Grid/LP window: ${dataStart || "ALL TIME"} → ${dataEnd || "now"} · SoloQ window: ${soloqStart || "ALL TIME"} → ${soloqEnd || "now"}`,
+  );
 
   // Track total games across all steps for a single import_log row at the end
   let totalGamesAllSteps = 0;
@@ -1649,8 +1660,8 @@ async function main() {
         let result = await scanCompetitive(
           turso,
           players[i],
-          dataRange.startDate,
-          dataRange.endDate,
+          dataStart,
+          dataEnd,
         );
 
         if (result.needsFallback && result.fallbackName) {
@@ -1666,8 +1677,8 @@ async function main() {
           result = await scanCompetitive(
             turso,
             fallbackPlayer,
-            dataRange.startDate,
-            dataRange.endDate,
+            dataStart,
+            dataEnd,
           );
         }
 
@@ -1790,8 +1801,8 @@ async function main() {
         workspaceId,
         players,
         scope: {
-          startDate: dataRange.startDate || null,
-          endDate: dataRange.endDate || null,
+          startDate: dataStart || null,
+          endDate: dataEnd || null,
         },
       });
       console.log(
