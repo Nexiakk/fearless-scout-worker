@@ -3,10 +3,9 @@
  *
  * Unified scouting worker for GitHub Actions.
  * Handles ALL scouting tasks in a single run:
- *   1. op.gg SoloQ scraping (fast aggregate stats)
- *   2. Riot API SoloQ scan (per-game data with role detection)
- *   3. Leaguepedia competitive (pro player champion pools)
- *   4. Team import (Grid.gg → Leaguepedia fallback)
+ *   1. Riot API SoloQ scan (per-game data with role detection)
+ *   2. Leaguepedia competitive (pro player champion pools)
+ *   3. Team import (Grid.gg → Leaguepedia fallback)
  *
  * Supports resume mode: checks import_log + existing data before each step.
  *
@@ -18,14 +17,13 @@
  *   WORKSPACE_ID       — Firestore workspace ID
  *   MODE               — "fresh" | "resume"
  *   PLAYERS_JSON       — JSON array of player objects
- *   OPTIONS_JSON       — JSON { doSoloq, soloqMethod, doCompetitive, doTeam, dataRange, soloqDataRange }
+ *   OPTIONS_JSON       — JSON { doSoloq, doCompetitive, doTeam, dataRange, soloqDataRange, includeTimeline }
  *   TEAM_JSON          — JSON { teamId, teamName, leaguepediaUrl, selectedTournaments }
  *   CALLBACK_URL       — Netlify function URL for progress reporting
  */
 
 const { createClient } = require("@libsql/client");
 const axios = require("axios");
-const cheerio = require("cheerio");
 const { ChampionNameMapper } = require("./champion-name-mapper.cjs");
 const {
   buildGameRosterMap,
@@ -110,7 +108,6 @@ function normalizeChampionName(name) {
 // ─── Stage label mapping ──────────────────────────────────────────────
 
 const STAGE_LABELS = {
-  opgg: { label: "op.gg SoloQ", icon: "🔍" },
   "riot-api": { label: "Riot API SoloQ", icon: "⚔️" },
   competitive: { label: "Leaguepedia Competitive", icon: "🏆" },
   team: { label: "Team Import", icon: "👥" },
@@ -354,113 +351,6 @@ async function hasTeamData(turso, teamId, tournament, source) {
   return (result.rows[0]?.cnt || 0) > 0;
 }
 
-// ─── Step 1: op.gg Scraping ──────────────────────────────────────────
-
-async function scrapeOpgg(turso, player, options) {
-  const { playerId, riotId, tag, region } = player;
-  console.log(`::notice::[op.gg] Scraping: ${riotId}#${tag}`);
-
-  // Only skip in resume mode — fresh scans always re-fetch (INSERT OR IGNORE handles duplicates)
-  if (MODE === "resume" && await hasPlayerSoloqData(turso, playerId)) {
-    console.log(`[op.gg] ${riotId}#${tag} already has SoloQ data, skipping (resume mode)`);
-    return { gamesImported: 0, skipped: true };
-  }
-
-  // Build op.gg champions URL
-  const server = (region || "euw1").replace(/\d+$/, "");
-  const url = `https://www.op.gg/en/lol/summoners/${server}/${encodeURIComponent(riotId)}-${encodeURIComponent(tag)}/champions?queue_type=SOLORANKED`;
-
-  try {
-    const response = await axios.get(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      },
-      timeout: 10000,
-    });
-
-    const $ = cheerio.load(response.data);
-    const nextDataScript = $("script#__NEXT_DATA__").html();
-    if (!nextDataScript) {
-      console.log(`[op.gg] No __NEXT_DATA__ found for ${riotId}#${tag}`);
-      return { gamesImported: 0 };
-    }
-
-    const nextData = JSON.parse(nextDataScript);
-    const pageProps = nextData?.props?.pageProps;
-    let championsData =
-      pageProps?.champions ||
-      pageProps?.championStats ||
-      pageProps?.data?.champions ||
-      pageProps?.summoner?.champions ||
-      [];
-
-    if (!Array.isArray(championsData) || championsData.length === 0) {
-      console.log(
-        `[op.gg] No champion data in __NEXT_DATA__ for ${riotId}#${tag}`,
-      );
-      return { gamesImported: 0 };
-    }
-
-    let totalGames = 0;
-    for (const champ of championsData) {
-      const name = normalizeChampionName(
-        champ.championName || champ.name || champ.champion || "",
-      );
-      const wins = champ.wins || champ.win || 0;
-      const losses = champ.losses || champ.loss || 0;
-      const games = champ.games || champ.totalGames || wins + losses;
-      if (!name || games === 0) continue;
-      totalGames += games;
-
-      // Extract KDA if available
-      let avgKills = null,
-        avgDeaths = null,
-        avgAssists = null,
-        avgGold = null,
-        avgCs = null;
-      if (champ.kda) {
-        avgKills = champ.kda.kills || champ.kda.k || null;
-        avgDeaths = champ.kda.deaths || champ.kda.d || null;
-        avgAssists = champ.kda.assists || champ.kda.a || null;
-      }
-
-      // Store each game individually
-      for (let g = 0; g < games; g++) {
-        try {
-          await turso.execute({
-            sql: `INSERT OR IGNORE INTO soloq_games (player_id, workspace_id, source, game_date, champion, kills, deaths, assists, gold, cs, win, role)
-                  VALUES (?, ?, 'opgg', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-            args: [
-              playerId,
-              WORKSPACE_ID,
-              new Date().toISOString().split("T")[0],
-              name,
-              Math.round(avgKills || 0),
-              Math.round(avgDeaths || 0),
-              Math.round(avgAssists || 0),
-              Math.round(avgGold || 0),
-              Math.round(avgCs || 0),
-              wins / games > 0.5 ? 1 : 0,
-            ],
-          });
-        } catch (err) {
-          if (!err.message.includes("UNIQUE"))
-            console.warn(`[op.gg] Insert error: ${err.message}`);
-        }
-      }
-    }
-
-    console.log(`[op.gg] ${riotId}#${tag}: ${totalGames} games imported`);
-    return { gamesImported: totalGames };
-  } catch (error) {
-    console.error(
-      `[op.gg] Scrape failed for ${riotId}#${tag}: ${error.message}`,
-    );
-    return { gamesImported: 0, error: error.message };
-  }
-}
-
 // ─── Step 2: Riot API Scan ──────────────────────────────────────────
 
 async function riotFetch(url) {
@@ -506,7 +396,64 @@ function findOpponentChampion(matchParticipants, puuid) {
   return enemy?.championName || null;
 }
 
-async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
+/**
+ * Extract lane differentials (CS / gold / XP vs the enemy laner) at 7 and
+ * 14 minutes from a match timeline (Sprint 6.2).
+ *
+ * Primary: compare our participant frame against the enemy laner's frame
+ * at the exact 7:00 / 14:00 timestamps. Fallback (when the enemy laner
+ * cannot be resolved): Riot's own per-minute delta maps for CS/gold.
+ * XP has no Riot delta map, so it is only filled from the frame comparison.
+ *
+ * @param {Object} timeline  - Riot match v5 timeline payload
+ * @param {Object} matchData - Riot match v5 match payload (participant ids)
+ * @param {string} puuid     - our player's PUUID
+ * @returns {{cs7: number|null, gold7: number|null, xp7: number|null,
+ *            cs14: number|null, gold14: number|null, xp14: number|null}}
+ */
+function extractTimelineDiffs(timeline, matchData, puuid) {
+  const result = {
+    cs7: null, gold7: null, xp7: null,
+    cs14: null, gold14: null, xp14: null,
+  };
+  const participants = matchData?.info?.participants;
+  const frames = timeline?.info?.frames;
+  if (!Array.isArray(participants) || !Array.isArray(frames)) return result;
+
+  const p = participants.find((part) => part.puuid === puuid);
+  if (!p) return result;
+
+  const enemy = participants.find(
+    (part) =>
+      part.teamId !== p.teamId &&
+      part.teamPosition &&
+      part.teamPosition === p.teamPosition,
+  );
+
+  for (const [minute, minuteKey] of [[7, "7"], [14, "14"]]) {
+    const frame = frames.find((f) => f.timestamp === minute * 60 * 1000);
+    const ourFrame = frame?.participantFrames?.[p.participantId];
+    if (!ourFrame) continue;
+
+    const enemyFrame = enemy
+      ? frame?.participantFrames?.[enemy.participantId]
+      : null;
+    if (enemyFrame) {
+      const cs = (pf) => (pf.minionsKilled || 0) + (pf.jungleMinionsKilled || 0);
+      result[`cs${minute}`] = cs(ourFrame) - cs(enemyFrame);
+      result[`gold${minute}`] = (ourFrame.totalGold || 0) - (enemyFrame.totalGold || 0);
+      result[`xp${minute}`] = (ourFrame.xp || 0) - (enemyFrame.xp || 0);
+    } else {
+      const csDelta = ourFrame.csDiffPerMinDeltas?.[minuteKey];
+      const goldDelta = ourFrame.goldDiffPerMinDeltas?.[minuteKey];
+      if (typeof csDelta === "number") result[`cs${minute}`] = Math.round(csDelta);
+      if (typeof goldDelta === "number") result[`gold${minute}`] = Math.round(goldDelta);
+    }
+  }
+  return result;
+}
+
+async function scanRiotApi(turso, player, startTimestamp, endTimestamp, includeTimeline) {
   const {
     playerId,
     riotId,
@@ -594,10 +541,40 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
       .toISOString()
       .split("T")[0];
 
+    // Optional timeline fetch (Sprint 6.2): extract CS/gold/XP lane
+    // differentials at 7 and 14 minutes. Doubles the API calls per game,
+    // so it is opt-in via OPTIONS_JSON.includeTimeline (default ON in the
+    // Import Data modal).
+    let timelineDiffs = null;
+    if (includeTimeline) {
+      const timeline = await riotFetch(
+        `https://${routing}.api.riotgames.com/lol/match/v5/matches/${matchIds[i]}/timeline`,
+      );
+      timelineDiffs = extractTimelineDiffs(timeline, matchData, puuid);
+    }
+
+    // kill_participation = (kills + assists) / team kills — computed from
+    // the full participant list (Riot's challenges.killParticipation is not
+    // reliably present).
+    const teamKills = matchData.info.participants
+      .filter((part) => part.teamId === p.teamId)
+      .reduce((sum, part) => sum + (part.kills || 0), 0);
+    const patch =
+      p.gameVersion && String(p.gameVersion).split(".").length >= 2
+        ? String(p.gameVersion).split(".").slice(0, 2).join(".")
+        : null;
+
     try {
       await turso.execute({
-        sql: `INSERT OR IGNORE INTO soloq_games (player_id, workspace_id, source, game_date, champion, opponent_champion, kills, deaths, assists, gold, cs, win, role, match_id)
-              VALUES (?, ?, 'riot-api', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sql: `INSERT OR IGNORE INTO soloq_games (
+                player_id, workspace_id, source, game_date, champion, opponent_champion,
+                kills, deaths, assists, gold, cs, win, role, match_id,
+                duration, patch, vision_score, wards_placed, wards_killed, control_wards,
+                damage_dealt, damage_taken, damage_to_turrets, kill_participation,
+                team_side, summoner1, summoner2, keystone,
+                cs_diff_7, gold_diff_7, xp_diff_7, cs_diff_14, gold_diff_14, xp_diff_14)
+              VALUES (?, ?, 'riot-api', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           playerId,
           WORKSPACE_ID,
@@ -612,6 +589,26 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp) {
           p.win ? 1 : 0,
           role,
           matchIds[i],
+          p.timePlayed || null,
+          patch,
+          p.visionScore || null,
+          p.wardsPlaced || null,
+          p.wardsKilled || null,
+          p.detectorWardsPlaced || null,
+          p.totalDamageDealtToChampions || null,
+          p.totalDamageTaken || null,
+          p.damageDealtToTurrets || null,
+          teamKills > 0 ? (p.kills + p.assists) / teamKills : null,
+          p.teamId === 100 ? "blue" : p.teamId === 200 ? "red" : null,
+          p.summoner1Id || null,
+          p.summoner2Id || null,
+          p.perks?.styles?.[0]?.selections?.[0]?.perk || null,
+          timelineDiffs?.cs7 ?? null,
+          timelineDiffs?.gold7 ?? null,
+          timelineDiffs?.xp7 ?? null,
+          timelineDiffs?.cs14 ?? null,
+          timelineDiffs?.gold14 ?? null,
+          timelineDiffs?.xp14 ?? null,
         ],
       });
       gamesImported++;
@@ -1542,15 +1539,14 @@ async function computeAggregates(turso, playerIds) {
 // ─── Main entry point ─────────────────────────────────────────────────
 
 /**
- * Phase order (Sprint 5.3):
- *   1. op.gg SoloQ       (deprecated — will be removed in Sprint 6.1)
- *   2. Team Import (Grid)  — team_games rows (drafts) from Grid, falling back
+ * Phase order (Sprint 5.3, op.gg removed in Sprint 6.1):
+ *   1. Team Import (Grid)  — team_games rows (drafts) from Grid, falling back
  *                            to Leaguepedia team drafts when the team has no
  *                            gridTeamId or a tournament has no Grid series
  *                            (Sprint 5.6). Also writes Grid per-player
  *                            competitive rows when Player Competitive is ON.
  *                            Tournament-driven (entry windows only).
- *   2b. Grid Player Competitive — Grid per-player competitive rows when
+ *   2. Grid Player Competitive — Grid per-player competitive rows when
  *                            Player Competitive is ON and Team is OFF.
  *   3. Leaguepedia Competitive — writes source='leaguepedia' rows
  *   4. Riot API SoloQ     — per-game role-filtered soloQ data
@@ -1599,6 +1595,9 @@ async function main() {
   const players = JSON.parse(PLAYERS_JSON);
   const options = JSON.parse(OPTIONS_JSON);
   const team = JSON.parse(TEAM_JSON);
+  // Timeline lane differentials (cs/gold/xp @7 & @14) are opt-in — one extra
+  // Riot API call per game. Import Data modal sends includeTimeline (default true).
+  const includeTimeline = options.includeTimeline === true;
 
   if (!Array.isArray(players) || players.length === 0) {
     console.error("[Fatal] No players provided");
@@ -1636,44 +1635,14 @@ async function main() {
 
   await reportProgress({ status: "started", totalPlayers: players.length });
 
-  // ── Step 1: op.gg SoloQ ─────────────────────────────────────────
-  console.log("::group::Step 1: op.gg SoloQ Scraping");
-  if (options.doSoloq && options.soloqMethod === "opgg") {
-    if (!(await isStepComplete(turso, "soloq_opgg"))) {
-      console.log("\n=== Step 1: op.gg SoloQ ===");
-      await reportProgress({ step: "opgg", status: "started" });
-
-      let totalGames = 0,
-        totalErrors = 0;
-      for (let i = 0; i < players.length; i++) {
-        await reportProgress({
-          step: "opgg",
-          currentPlayer: i + 1,
-          totalPlayers: players.length,
-          playerName: players[i].riotId,
-        });
-        const result = await scrapeOpgg(turso, players[i], options);
-        totalGames += result.gamesImported;
-        if (result.error) totalErrors++;
-      }
-
-      totalGamesAllSteps += totalGames;
-      totalErrorsAllSteps += totalErrors;
-      await reportProgress({ step: "opgg", status: "completed", totalGames });
-    } else {
-      console.log("[Resume] op.gg SoloQ already complete, skipping");
-    }
-  }
-
-  // ── Step 2: Team Import — team_games (drafts) only when doTeam is on.
+  // ── Step 1: Team Import — team_games (drafts) only when doTeam is on.
   //    Grid also writes per-player competitive rows here when Player
   //    Competitive is ON (writePlayerGames). Runs BEFORE the LP competitive
   //    step so Grid rows land first (Sprint 5.3 phase reorder).
-  console.log("::endgroup::");
-  console.log("::group::Step 2: Team Import");
+  console.log("::group::Step 1: Team Import");
   if (options.doTeam && team.teamId && team.selectedTournaments?.length > 0) {
     if (!(await isStepComplete(turso, "team_import"))) {
-      console.log("\n=== Step 2: Team Import (Grid) ===");
+      console.log("\n=== Step 1: Team Import (Grid) ===");
       await reportProgress({ step: "team", status: "started" });
 
       let totalImported = 0;
@@ -1698,12 +1667,12 @@ async function main() {
     }
   }
 
-  // ── Step 2b: Grid Player Competitive — per-player competitive rows from
+  // ── Step 2: Grid Player Competitive — per-player competitive rows from
   //    Grid when Player Competitive is ON and Team is OFF (full re-gate,
   //    user preference 2026-08-02). Player rows are clipped to the
   //    competitive range inside importTeamDataFromGrid.
   console.log("::endgroup::");
-  console.log("::group::Step 2b: Grid Player Competitive");
+  console.log("::group::Step 2: Grid Player Competitive");
   if (
     options.doCompetitive &&
     !options.doTeam &&
@@ -1711,7 +1680,7 @@ async function main() {
     team.gridTeamId &&
     team.selectedTournaments?.length > 0
   ) {
-    console.log("\n=== Step 2b: Grid Player Competitive ===");
+    console.log("\n=== Step 2: Grid Player Competitive ===");
     await reportProgress({ step: "grid", status: "started", subStep: "player-competitive" });
 
     let totalPlayerEntries = 0;
@@ -1792,7 +1761,7 @@ async function main() {
   // ── Step 4: Riot API SoloQ ───────────────────────────────────────
   console.log("::endgroup::");
   console.log("::group::Step 4: Riot API SoloQ");
-  if (options.doSoloq && options.soloqMethod === "riot-api") {
+  if (options.doSoloq) {
     if (!(await isStepComplete(turso, "soloq_riot_api"))) {
       console.log("\n=== Step 4: Riot API SoloQ ===");
       await reportProgress({ step: "riot-api", status: "started" });
@@ -1814,6 +1783,7 @@ async function main() {
             players[i],
             startTimestamp,
             endTimestamp,
+            includeTimeline,
           );
           totalFound += result.gamesFound || 0;
           totalImported += result.gamesImported || 0;
@@ -1944,6 +1914,8 @@ module.exports = {
   importTeamData,
   importTeamDataFromGrid,
   importTeamDataFromLeaguepedia,
+  scanRiotApi,
+  extractTimelineDiffs,
   setChampionMapper(mapper) {
     championMapper = mapper;
   },

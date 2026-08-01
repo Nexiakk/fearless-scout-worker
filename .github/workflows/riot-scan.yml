@@ -17,7 +17,7 @@ on:
         description: 'JSON array of { playerId, riotId, tag, region, puuid, leaguepediaUrl, leaguepediaSlug, playerOverrideName, assignedRole }'
         required: true
       options:
-        description: 'JSON: { doSoloq, soloqMethod (opgg|riot-api), doCompetitive, doTeam, dataRange: {type, startDate?, endDate?} }'
+        description: 'JSON: { doSoloq, doCompetitive, doTeam, dataRange: {type, startDate?, endDate?}, soloqDataRange: {type, startDate?, endDate?}, includeTimeline: bool }'
         required: true
       team:
         description: 'JSON: { teamId, teamName, leaguepediaUrl, selectedTournaments } or empty'

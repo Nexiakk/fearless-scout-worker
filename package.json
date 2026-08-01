@@ -2,14 +2,13 @@
   "name": "fearless-scout-worker",
   "version": "1.0.0",
   "private": true,
-  "description": "GitHub Actions worker for all scouting tasks: op.gg scraping, Riot API scan, Leaguepedia, team import",
+  "description": "GitHub Actions worker for all scouting tasks: Riot API scan, Leaguepedia, Grid team import",
   "scripts": {
     "scan": "node scripts/run-scan.cjs"
   },
   "dependencies": {
     "@libsql/client": "^0.14.0",
     "axios": "^1.7.0",
-    "cheerio": "^1.0.0",
     "firebase-admin": "^12.0.0"
   }
 }
