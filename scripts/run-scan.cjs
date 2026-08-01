@@ -641,7 +641,7 @@ async function fetchLeaguepediaCargo(params) {
   return null;
 }
 
-async function scanCompetitive(turso, player) {
+async function scanCompetitive(turso, player, startDate, endDate) {
   const {
     playerId,
     riotId,
@@ -671,6 +671,13 @@ async function scanCompetitive(turso, player) {
   // SPVs.Team=TeamVs — alias to get opponent team name
   // SP.IngameRole=Role — alias for clarity
   // SG.Gamelength — game duration in "MM:SS" format
+  // Build WHERE clause with optional date range filter (Sprint 5.3).
+  // Date filter is opt-in via the startDate/endDate params; default
+  // scope (last 12 months) is enforced in main() before calling this.
+  let whereClause = `SP.Link = "${lpName}"`;
+  if (startDate) whereClause += ` AND SG.DateTime_UTC >= "${startDate}"`;
+  if (endDate) whereClause += ` AND SG.DateTime_UTC <= "${endDate}"`;
+
   const data = await fetchLeaguepediaCargo({
     tables: "ScoreboardPlayers=SP,ScoreboardPlayers=SPVs,ScoreboardGames=SG",
     fields: [
@@ -696,7 +703,7 @@ async function scanCompetitive(turso, player) {
       "SP.VisionScore",
       "SG.Gamelength",
     ].join(","),
-    where: `SP.Link = "${lpName}"`,
+    where: whereClause,
     join_on: "SG.GameId=SP.GameId,SP.UniqueRoleVs=SPVs.UniqueRole",
     limit: "500",
     format: "json",
@@ -1138,6 +1145,25 @@ async function computeAggregates(turso, playerIds) {
 
 // ─── Main entry point ─────────────────────────────────────────────────
 
+/**
+ * Phase order (Sprint 5.3):
+ *   1. op.gg SoloQ       (deprecated — will be removed in Sprint 6.1)
+ *   2. Team Import (Grid)  — writes source='grid' rows in competitive_games
+ *   3. Leaguepedia Competitive — writes source='leaguepedia' rows
+ *   4. Riot API SoloQ     — per-game role-filtered soloQ data
+ *   5. Aggregation        — no-op (raw-query architecture)
+ *   6. Flag Computation   — single-player flags (comparative not yet wired)
+ *
+ * Dual-source contract: Grid and Leaguepedia write to competitive_games
+ * independently. They use different ID spaces (grid_game_id vs
+ * leaguepedia_game_id), so the same game can have rows from both sources.
+ * The UI surfaces source provenance per row. There is NO cross-source
+ * dedup at the row level; INSERT OR IGNORE handles within-source dedup.
+ *
+ * Default scope: last 12 months. User-configurable via
+ * OPTIONS_JSON.dataRange.{startDate,endDate}.
+ */
+
 async function main() {
   console.log("=== Full Scouting Scan (GitHub Actions) ===");
   console.log(`Job ID: ${JOB_ID}, Workspace: ${WORKSPACE_ID}, Mode: ${MODE}`);
@@ -1168,7 +1194,17 @@ async function main() {
   const turso = createClient({ url: TURSO_URL, authToken: TURSO_TOKEN });
   console.log(`Connected to Turso, ${players.length} players`);
 
+  // Default scope: last 12 months when startDate isn't provided (Sprint 5.3).
+  // Both Grid (via dataRange.startTimeGte/Lte) and LP (via the whereClause
+  // built in scanCompetitive) honour the same window.
   const dataRange = options.dataRange || {};
+  if (!dataRange.startDate) {
+    dataRange.startDate = new Date(
+      Date.now() - 365 * 24 * 60 * 60 * 1000,
+    )
+      .toISOString()
+      .split("T")[0];
+  }
   const startTimestamp = dataRange.startDate
     ? Math.floor(new Date(dataRange.startDate).getTime() / 1000)
     : null;
@@ -1211,12 +1247,99 @@ async function main() {
     }
   }
 
-  // ── Step 2: Riot API SoloQ ───────────────────────────────────────
+  // ── Step 2: Team Import (Grid) — runs BEFORE competitive so the
+  //    Grid import writes source='grid' rows first; LP only adds
+  //    source='leaguepedia' rows for games Grid doesn't cover.
+  //    (Sprint 5.3 phase reorder)
   console.log("::endgroup::");
-  console.log("::group::Step 2: Riot API SoloQ");
+  console.log("::group::Step 2: Team Import");
+  if (options.doTeam && team.teamId && team.selectedTournaments?.length > 0) {
+    if (!(await isStepComplete(turso, "team_import"))) {
+      console.log("\n=== Step 2: Team Import (Grid) ===");
+      await reportProgress({ step: "team", status: "started" });
+
+      let totalImported = 0;
+      for (const tournament of team.selectedTournaments) {
+        await reportProgress({ step: "team", tournament });
+        const result = await importTeamData(turso, team, tournament);
+        totalImported += result.importedGames || 0;
+      }
+      totalGamesAllSteps += totalImported;
+      await reportProgress({
+        step: "team",
+        status: "completed",
+        totalImported,
+      });
+    } else {
+      console.log("[Resume] Team import already complete, skipping");
+    }
+  }
+
+  // ── Step 3: Leaguepedia Competitive ──────────────────────────────
+  //    Writes source='leaguepedia' rows. No cross-source dedup:
+  //    Grid and LP use different ID spaces, so the same game can
+  //    legitimately have rows from both. UI surfaces source per row.
+  console.log("::endgroup::");
+  console.log("::group::Step 3: Leaguepedia Competitive");
+  if (options.doCompetitive) {
+    if (!(await isStepComplete(turso, "competitive"))) {
+      console.log("\n=== Step 3: Leaguepedia Competitive ===");
+      await reportProgress({ step: "competitive", status: "started" });
+
+      let totalImported = 0;
+      for (let i = 0; i < players.length; i++) {
+        await reportProgress({
+          step: "competitive",
+          currentPlayer: i + 1,
+          totalPlayers: players.length,
+          playerName: players[i].riotId,
+        });
+        let result = await scanCompetitive(
+          turso,
+          players[i],
+          dataRange.startDate,
+          dataRange.endDate,
+        );
+
+        if (result.needsFallback && result.fallbackName) {
+          console.log(
+            `[Competitive] Retrying with fallback name: ${result.fallbackName}`,
+          );
+          await sleep(1000);
+          const fallbackPlayer = {
+            ...players[i],
+            leaguepediaSlug: null,
+            playerOverrideName: result.fallbackName,
+          };
+          result = await scanCompetitive(
+            turso,
+            fallbackPlayer,
+            dataRange.startDate,
+            dataRange.endDate,
+          );
+        }
+
+        totalImported += result.gamesImported || 0;
+
+        await sleep(300);
+      }
+      totalGamesAllSteps += totalImported;
+      await reportProgress({
+        step: "competitive",
+        status: "completed",
+        totalImported,
+      });
+    } else {
+      console.log("[Resume] Competitive already complete, skipping");
+    }
+  }
+
+  // ── Step 4: Riot API SoloQ ───────────────────────────────────────
+  console.log("::endgroup::");
+  console.log("::group::Step 4: Riot API SoloQ");
   if (options.doSoloq && options.soloqMethod === "riot-api") {
     if (!(await isStepComplete(turso, "soloq_riot_api"))) {
-      console.log("\n=== Step 2: Riot API SoloQ ===");
+      console.log("\n=== Step 4: Riot API SoloQ ===");
       await reportProgress({ step: "riot-api", status: "started" });
 
       if (!RIOT_API_KEY) {
@@ -1251,77 +1374,6 @@ async function main() {
       }
     } else {
       console.log("[Resume] Riot API SoloQ already complete, skipping");
-    }
-  }
-
-  // ── Step 3: Leaguepedia Competitive ──────────────────────────────
-  console.log("::endgroup::");
-  console.log("::group::Step 3: Leaguepedia Competitive");
-  if (options.doCompetitive) {
-    if (!(await isStepComplete(turso, "competitive"))) {
-      console.log("\n=== Step 3: Leaguepedia Competitive ===");
-      await reportProgress({ step: "competitive", status: "started" });
-
-      let totalImported = 0;
-      for (let i = 0; i < players.length; i++) {
-        await reportProgress({
-          step: "competitive",
-          currentPlayer: i + 1,
-          totalPlayers: players.length,
-          playerName: players[i].riotId,
-        });
-        let result = await scanCompetitive(turso, players[i]);
-
-        if (result.needsFallback && result.fallbackName) {
-          console.log(
-            `[Competitive] Retrying with fallback name: ${result.fallbackName}`,
-          );
-          await sleep(1000);
-          const fallbackPlayer = {
-            ...players[i],
-            leaguepediaSlug: null,
-            playerOverrideName: result.fallbackName,
-          };
-          result = await scanCompetitive(turso, fallbackPlayer);
-        }
-
-        totalImported += result.gamesImported || 0;
-
-        await sleep(300);
-      }
-      totalGamesAllSteps += totalImported;
-      await reportProgress({
-        step: "competitive",
-        status: "completed",
-        totalImported,
-      });
-    } else {
-      console.log("[Resume] Competitive already complete, skipping");
-    }
-  }
-
-  // ── Step 4: Team Import ──────────────────────────────────────────
-  console.log("::endgroup::");
-  console.log("::group::Step 4: Team Import");
-  if (options.doTeam && team.teamId && team.selectedTournaments?.length > 0) {
-    if (!(await isStepComplete(turso, "team_import"))) {
-      console.log("\n=== Step 4: Team Import ===");
-      await reportProgress({ step: "team", status: "started" });
-
-      let totalImported = 0;
-      for (const tournament of team.selectedTournaments) {
-        await reportProgress({ step: "team", tournament });
-        const result = await importTeamData(turso, team, tournament);
-        totalImported += result.importedGames || 0;
-      }
-      totalGamesAllSteps += totalImported;
-      await reportProgress({
-        step: "team",
-        status: "completed",
-        totalImported,
-      });
-    } else {
-      console.log("[Resume] Team import already complete, skipping");
     }
   }
 
