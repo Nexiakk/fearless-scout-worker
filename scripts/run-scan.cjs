@@ -27,6 +27,11 @@ const { createClient } = require("@libsql/client");
 const axios = require("axios");
 const cheerio = require("cheerio");
 const { ChampionNameMapper } = require("./champion-name-mapper.cjs");
+const {
+  buildGameRosterMap,
+  matchParticipantToPlayer,
+  findOpponentChampion: findOpponentChampionFromSummary,
+} = require("./participant-matching.cjs");
 
 // ─── Force stdout/stderr flushing for live GitHub Actions logs ─────────
 if (process.stdout._handle && process.stdout._handle.setBlocking) {
@@ -332,11 +337,20 @@ async function hasPlayerCompData(turso, playerId) {
   return (result.rows[0]?.cnt || 0) > 0;
 }
 
-async function hasTeamData(turso, teamId, tournament) {
-  const result = await turso.execute({
-    sql: `SELECT COUNT(*) as cnt FROM team_games WHERE team_id = ? AND tournament = ? AND (source = 'grid' OR source = 'gridgg')`,
-    args: [teamId, tournament],
-  });
+/**
+ * Check whether a team already has team_games rows for a tournament.
+ * @param {string} source - Optional: restrict the check to one source
+ * ('grid' | 'leaguepedia'). When omitted, any source counts — used for
+ * legacy string tournament entries (pre-5.2 behavior).
+ */
+async function hasTeamData(turso, teamId, tournament, source) {
+  let sql = `SELECT COUNT(*) as cnt FROM team_games WHERE team_id = ? AND tournament = ?`;
+  const args = [teamId, tournament];
+  if (source) {
+    sql += ` AND source = ?`;
+    args.push(source);
+  }
+  const result = await turso.execute({ sql, args });
   return (result.rows[0]?.cnt || 0) > 0;
 }
 
@@ -650,11 +664,13 @@ async function scanCompetitive(turso, player, startDate, endDate) {
     leaguepediaUrl,
     leaguepediaSlug,
   } = player;
+  // Wiki URLs use underscores for spaces; SP.Link / Team1 / Team2 store the
+  // display name with spaces, so convert slug-derived values before matching.
   const lpName =
-    leaguepediaSlug ||
+    leaguepediaSlug?.replace(/_/g, " ") ||
     playerOverrideName ||
     (leaguepediaUrl
-      ? decodeURIComponent(leaguepediaUrl.match(/wiki\/([^/?]+)/)?.[1] || "")
+      ? decodeURIComponent(leaguepediaUrl.match(/wiki\/([^/?]+)/)?.[1] || "").replace(/_/g, " ")
       : riotId);
 
   console.log(
@@ -863,65 +879,121 @@ async function getTursoClient(dbName) {
   return createClient({ url: TURSO_URL, authToken: TURSO_TOKEN });
 }
 
-async function importTeamData(turso, team, tournamentName) {
+/**
+ * Normalize a selectedTournaments entry to a plain tournament name.
+ * Entries may be objects ({ name, source, dateStart, dateEnd, ... }) as
+ * produced by the Sprint 5.2 team tournament picker, or plain strings.
+ */
+function tournamentNameOf(entry) {
+  if (!entry) return "";
+  return typeof entry === "string" ? entry : entry.name || "";
+}
+
+/**
+ * Effective fetch window for a tournament entry: intersection of the
+ * global dataRange and the per-tournament dateStart/dateEnd (the picker
+ * clips each tournament to the user's import window — §2.2).
+ * Returns { startTimeGte, startTimeLte } ISO strings, or null bounds.
+ */
+function tournamentWindow(tournamentEntry, dataRange) {
+  let start = dataRange?.startDate ? new Date(dataRange.startDate) : null;
+  let end = dataRange?.endDate ? new Date(dataRange.endDate) : null;
+  if (tournamentEntry && typeof tournamentEntry === "object") {
+    if (tournamentEntry.dateStart) {
+      const ts = new Date(tournamentEntry.dateStart);
+      if (!start || ts > start) start = ts;
+    }
+    if (tournamentEntry.dateEnd) {
+      const te = new Date(tournamentEntry.dateEnd);
+      if (!end || te < end) end = te;
+    }
+  }
+  return {
+    startTimeGte: start ? start.toISOString() : null,
+    startTimeLte: end ? end.toISOString() : null,
+  };
+}
+
+/**
+ * Import a single tournament for a team.
+ *
+ * Source routing (Sprint 5.6):
+ *   - Entry source 'leaguepedia'  → LP team import only (ScoreboardGames).
+ *   - Entry source 'grid' (or legacy string entries) → Grid first (when the
+ *     team has a gridTeamId); when Grid produces no games for the tournament
+ *     (no series found), fall back to the LP team import. §2.3a: both sources
+ *     are peer-level — a tournament the Grid API doesn't cover still gets
+ *     team_games rows from Leaguepedia.
+ *
+ * No import-time dedup across sources: Grid and LP rows use different ID
+ * spaces (source_game_id = grid game id vs LP GameId) and coexist; the
+ * display layer dedups (same rule as competitive_games).
+ */
+async function importTeamData(turso, team, tournamentEntry) {
+  const tournamentName = tournamentNameOf(tournamentEntry);
   console.log(`[Team] Importing tournament: ${tournamentName}`);
 
-  if (await hasTeamData(turso, team.teamId, tournamentName)) {
-    console.log(`[Team] ${tournamentName} already imported, skipping`);
+  // Entry-level source from the Sprint 5.2 picker ({ name, source, ... }).
+  // Legacy string entries behave like 'grid' (Grid first, LP fallback).
+  const entrySource =
+    tournamentEntry && typeof tournamentEntry === "object"
+      ? tournamentEntry.source
+      : null;
+
+  // Resume guard — per-source: a grid-imported tournament doesn't block an
+  // LP entry for the same name, and vice versa.
+  if (await hasTeamData(turso, team.teamId, tournamentName, entrySource || undefined)) {
+    console.log(`[Team] ${tournamentName} already imported (${entrySource || "any"}), skipping`);
     return { importedGames: 0, skipped: true };
   }
 
-  // If team has a gridTeamId, use Grid.gg API for real data
-  if (team.gridTeamId) {
-    return await importTeamDataFromGrid(turso, team, tournamentName);
+  const gridEligible = !!team.gridTeamId && entrySource !== "leaguepedia";
+
+  if (gridEligible) {
+    const result = await importTeamDataFromGrid(turso, team, tournamentEntry);
+    const gridGames = result.importedGames || 0;
+    if (gridGames > 0) {
+      return { importedGames: gridGames, importedPlayers: result.importedPlayers || 0 };
+    }
+    // Grid produced nothing for this tournament (no series, or no games with
+    // draft data) → fall back to the LP team import.
+    console.log(
+      `[Team] No Grid games for "${tournamentName}" (series found: ${result.seriesFound || 0}) — falling back to Leaguepedia`,
+    );
   }
 
-  // Fallback: insert placeholder row (legacy behavior)
-  let importedGames = 0;
-  try {
-    await turso.execute({
-      sql: `INSERT OR IGNORE INTO team_games (team_id, workspace_id, tournament, game_date, opponent, win, picks, bans, opp_picks, opp_bans, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'grid')`,
-      args: [
-        team.teamId,
-        WORKSPACE_ID,
-        tournamentName,
-        new Date().toISOString().split("T")[0],
-        "Unknown",
-        null,
-        "[]",
-        "[]",
-        "[]",
-        "[]",
-      ],
-    });
-    importedGames++;
-  } catch (err) {
-    if (!err.message.includes("UNIQUE"))
-      console.warn(`[Team] Insert error: ${err.message}`);
-  }
-
-  return { importedGames };
+  const result = await importTeamDataFromLeaguepedia(turso, team, tournamentEntry);
+  return { importedGames: result.importedGames || 0, source: "leaguepedia" };
 }
 
 /**
  * Import team data from Grid.gg API.
  * Fetches series, draft data, and Riot summary files for the team's tournaments.
+ *
+ * Participant matching (Sprint 5.4): participants are matched to our scouted
+ * players by exact gridPlayerId via the series-state roster, falling back to
+ * normalized name matching. Grid rows additionally carry side_label,
+ * grid_series_id/grid_game_id and a filled opponent_champion.
  */
-async function importTeamDataFromGrid(turso, team, tournamentName) {
+async function importTeamDataFromGrid(turso, team, tournamentEntry) {
+  const tournamentName = tournamentNameOf(tournamentEntry);
   console.log(`[Grid] Importing ${team.teamName} from Grid.gg for tournament: ${tournamentName}`);
   await reportProgress({ step: "grid", status: "started", tournament: tournamentName });
 
   const grid = require("./grid-client.cjs");
   grid.initialize(championMapper);
 
-  // Fetch series for this team from Grid
+  const players = JSON.parse(PLAYERS_JSON);
+
+  // Fetch series for this team from Grid — scoped to the global dataRange
+  // intersected with the per-tournament window (dateStart/dateEnd).
   const dataRange = JSON.parse(OPTIONS_JSON).dataRange || {};
+  const window = tournamentWindow(tournamentEntry, dataRange);
   const options = {
     limit: 50,
   };
-  if (dataRange.startDate) options.startTimeGte = new Date(dataRange.startDate).toISOString();
-  if (dataRange.endDate) options.startTimeLte = new Date(dataRange.endDate).toISOString();
+  if (window.startTimeGte) options.startTimeGte = window.startTimeGte;
+  if (window.startTimeLte) options.startTimeLte = window.startTimeLte;
 
   const series = await grid.fetchSeriesByTeamId(team.gridTeamId, options);
   console.log(`[Grid] Found ${series.length} series for team ${team.teamName}`);
@@ -935,6 +1007,7 @@ async function importTeamDataFromGrid(turso, team, tournamentName) {
 
   let importedGames = 0;
   let importedPlayers = 0;
+  const seriesFound = filteredSeries.length;
 
   for (const s of filteredSeries) {
     await reportProgress({
@@ -951,6 +1024,10 @@ async function importTeamDataFromGrid(turso, team, tournamentName) {
       console.log(`[Grid] No games for series ${s.id}, skipping`);
       continue;
     }
+
+    // Per-game roster with GRID player IDs (Sprint 5.4) — used to match
+    // participants by exact gridPlayerId instead of name substrings.
+    const gameRoster = buildGameRosterMap(seriesState, championMapper);
 
     // Determine which team is "us" and which is opponent
     const ourTeamOnGrid = s.teams?.find(t => t.baseInfo?.id === team.gridTeamId);
@@ -1014,7 +1091,9 @@ async function importTeamDataFromGrid(turso, team, tournamentName) {
             JSON.stringify(ourBans),
             JSON.stringify(oppPicks),
             JSON.stringify(oppBans),
-            String(s.id), // source_game_id
+            String(game.id), // source_game_id — per-game id (was the series id,
+                             // which made INSERT OR IGNORE drop all but one game
+                             // per Bo3/Bo5 series — fixed in Sprint 5.6)
             JSON.stringify(bluePicks),
             JSON.stringify(redPicks),
             JSON.stringify(blueBans),
@@ -1073,31 +1152,35 @@ async function importTeamDataFromGrid(turso, team, tournamentName) {
         console.warn(`[Grid] team_games update error: ${err.message}`);
       }
 
-      // Try to match participants to stored players by name
-      const players = JSON.parse(PLAYERS_JSON);
+      // Match participants to stored players: exact gridPlayerId via the
+      // series-state roster first, normalized name match as fallback.
+      let matched = 0;
+      const unmatched = [];
       for (const p of participants) {
-        // Find matching player by checking if their name appears in the participant's riotIdGameName
-        const matchedPlayer = players.find(pl => {
-          if (!p.playerName) return false;
-          const nameLower = p.playerName.toLowerCase();
-          return nameLower.includes(pl.riotId?.toLowerCase() || '') ||
-                 (pl.gridPlayerId && p.playerName.toLowerCase().includes(pl.name?.toLowerCase() || ''));
-        });
+        const matchedPlayer = matchParticipantToPlayer(
+          p,
+          gameRoster.get(game.id),
+          players,
+        );
 
         if (matchedPlayer) {
+          matched++;
+          // Opponent champion at the same role on the other side (was NULL before Sprint 5.4)
+          const opponentChampion = findOpponentChampionFromSummary(p, participants);
+
           // Insert into competitive_games for this player
           try {
             await turso.execute({
               sql: `INSERT OR IGNORE INTO competitive_games 
-                    (player_id, workspace_id, source, source_game_id, game_date, champion, opponent_champion, tournament, opponent, win, kills, deaths, assists, cs, gold, side, role, duration)
-                    VALUES (?, ?, 'grid', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    (player_id, workspace_id, source, source_game_id, game_date, champion, opponent_champion, tournament, opponent, win, kills, deaths, assists, cs, gold, side, side_label, role, duration, grid_series_id, grid_game_id)
+                    VALUES (?, ?, 'grid', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               args: [
                 matchedPlayer.playerId,
                 WORKSPACE_ID,
                 `${s.id}_g${game.sequenceNumber}_p${p.participantId}`, // source_game_id
                 gameDate,
                 p.championName,
-                null, // opponent_champion — not easily determined from summary alone
+                opponentChampion,
                 tournamentName || s.tournament?.name || "Unknown",
                 opponentName,
                 p.win,
@@ -1107,8 +1190,11 @@ async function importTeamDataFromGrid(turso, team, tournamentName) {
                 p.cs,
                 p.goldEarned,
                 p.side,
+                p.side, // side_label — side of the team_games row
                 p.role,
                 summaryData.gameDuration ? Math.round(summaryData.gameDuration) : null,
+                String(s.id),
+                game.id,
               ],
             });
             importedPlayers++;
@@ -1116,7 +1202,17 @@ async function importTeamDataFromGrid(turso, team, tournamentName) {
             if (!err.message.includes("UNIQUE"))
               console.warn(`[Grid] competitive_games insert error: ${err.message}`);
           }
+        } else {
+          unmatched.push(p.playerName || `participant_${p.participantId}`);
         }
+      }
+
+      if (unmatched.length > 0) {
+        console.warn(
+          `[Grid] Game ${game.sequenceNumber} (${s.id}): ${matched}/${participants.length} participants matched — unmatched: ${unmatched.join(", ")}`,
+        );
+      } else if (participants.length > 0) {
+        console.log(`[Grid] Game ${game.sequenceNumber} (${s.id}): ${matched}/${participants.length} participants matched`);
       }
     }
 
@@ -1131,7 +1227,258 @@ async function importTeamDataFromGrid(turso, team, tournamentName) {
     totalPlayerEntries: importedPlayers,
   });
 
-  return { importedGames, importedPlayers };
+  return { importedGames, importedPlayers, seriesFound };
+}
+
+// ─── Step 4b: Leaguepedia team import (fallback for non-Grid tournaments) ──
+
+/**
+ * Parse a CargoExport response into an array of rows.
+ * Handles: pre-parsed arrays (axios auto-JSON), JSON strings, { response }.
+ */
+function parseCargoJsonRows(data) {
+  if (!data) return [];
+  if (Array.isArray(data)) return data;
+  if (typeof data === "string") {
+    try {
+      return JSON.parse(data);
+    } catch {
+      return [];
+    }
+  }
+  if (Array.isArray(data.response)) return data.response;
+  return [];
+}
+
+/**
+ * Parse a Leaguepedia picks/bans cell into an array of champion-name strings.
+ * Handles the formats seen in ScoreboardGames: pre-parsed JSON arrays of
+ * strings (verified live 2026-08-02), arrays of { champion, role } objects
+ * (legacy/edge data), comma-separated strings, and null/empty values.
+ */
+function normalizeChampionList(value) {
+  if (!value) return [];
+  let entries = value;
+  if (typeof entries === "string") {
+    try {
+      entries = JSON.parse(entries);
+    } catch {
+      return entries
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((c) => normalizeChampionName(c));
+    }
+  }
+  if (!Array.isArray(entries)) return [];
+  return entries
+    .map((e) => {
+      if (typeof e === "string") return e;
+      if (e && typeof e === "object") return e.champion || e.name || "";
+      return "";
+    })
+    .filter(Boolean)
+    .map((c) => normalizeChampionName(c));
+}
+
+/**
+ * Parse Leaguepedia Gamelength ("MM:SS" string) into integer seconds.
+ * Falls back to a plain integer (some older exports store seconds).
+ */
+function parseGamelength(value) {
+  if (!value) return null;
+  const str = String(value);
+  const parts = str.split(":");
+  if (parts.length === 2) {
+    const mins = parseInt(parts[0]);
+    const secs = parseInt(parts[1]);
+    if (!isNaN(mins) && !isNaN(secs)) return mins * 60 + secs;
+  }
+  const secs = parseInt(str);
+  return isNaN(secs) ? null : secs;
+}
+
+/**
+ * Extract the game number within its match from an LP GameId. GameIds end
+ * with the game number (`..._Finals_1_1` → 1, `..._Week 5_5_2` → 2).
+ */
+function parseGameNumber(gameId) {
+  if (!gameId) return null;
+  const last = String(gameId).split("_").pop();
+  const n = parseInt(last);
+  return isNaN(n) ? null : n;
+}
+
+/**
+ * Import team drafts from Leaguepedia (ScoreboardGames) — the fallback for
+ * tournaments Grid.gg doesn't cover (no gridTeamId, or no Grid series found).
+ *
+ * Scoped to the tournament entry name intersected with the global dataRange
+ * (tournamentWindow applies the per-entry dateStart/dateEnd clipping — §2.2).
+ * Writes team_games rows with source='leaguepedia' and source_game_id = LP's
+ * GameId (unique per game). No import-time dedup vs Grid rows — the display
+ * layer dedups across sources (same rule as competitive_games).
+ *
+ * LP data contract (verified live 2026-08-02):
+ *   - ScoreboardGames needs an EXACT team-name match — resolved from the
+ *     team's leaguepediaUrl wiki slug (underscores → spaces), falling back
+ *     to the user-facing team name.
+ *   - Team1 = team listed first (Blue per Leaguepedia convention), Team2 =
+ *     Red. ScoreboardGames has no explicit side field.
+ *   - Winner: 1 = Team1 won, 2 = Team2 won.
+ *   - Gamelength: "MM:SS" string; Patch: float.
+ *   - DateTime_UTC comes back as "DateTime UTC" (space) from CargoExport.
+ *   - Team1Picks/Team2Picks/Team1Bans/Team2Bans: JSON arrays of champion
+ *     names (CargoExport returns them pre-parsed).
+ *
+ * @returns {Promise<{ importedGames: number, skipped?: boolean }>}
+ */
+async function importTeamDataFromLeaguepedia(turso, team, tournamentEntry) {
+  const tournamentName = tournamentNameOf(tournamentEntry);
+  const teamName = team.teamName || "";
+  console.log(
+    `[Team][LP] Importing ${teamName} drafts from Leaguepedia for tournament: ${tournamentName}`,
+  );
+  await reportProgress({
+    step: "team",
+    status: "started",
+    tournament: tournamentName,
+    source: "leaguepedia",
+  });
+
+  // LP team name: prefer the team's Leaguepedia URL slug (ScoreboardGames
+  // needs an exact team-name match; the slug IS the LP name — e.g. the wiki
+  // page "WLGaming_Esports" stores "WLGaming Esports"). Fall back to the
+  // user-facing team name.
+  const lpTeamName = team.leaguepediaUrl
+    ? decodeURIComponent(team.leaguepediaUrl.match(/wiki\/([^/?]+)/)?.[1] || "").replace(/_/g, " ") || teamName
+    : teamName;
+  if (!lpTeamName) {
+    console.warn(
+      "[Team][LP] No Leaguepedia team name (no leaguepediaUrl, no teamName) — skipping LP import",
+    );
+    return { importedGames: 0, skipped: true };
+  }
+
+  // Scope: global dataRange intersected with the per-tournament window.
+  const dataRange = JSON.parse(OPTIONS_JSON).dataRange || {};
+  const window = tournamentWindow(tournamentEntry, dataRange);
+
+  const safeName = lpTeamName.replace(/"/g, '\\"');
+  const safeTournament = tournamentName.replace(/"/g, '\\"');
+  const whereParts = [`(SG.Team1 = "${safeName}" OR SG.Team2 = "${safeName}")`];
+  if (safeTournament) whereParts.push(`SG.Tournament = "${safeTournament}"`);
+  if (window.startTimeGte) whereParts.push(`SG.DateTime_UTC >= "${window.startTimeGte}"`);
+  if (window.startTimeLte) whereParts.push(`SG.DateTime_UTC <= "${window.startTimeLte}"`);
+
+  const data = await fetchLeaguepediaCargo({
+    tables: "ScoreboardGames=SG",
+    fields: [
+      "SG.GameId",
+      "SG.DateTime_UTC",
+      "SG.Tournament",
+      "SG.Team1",
+      "SG.Team2",
+      "SG.Winner",
+      "SG.Gamelength",
+      "SG.Patch",
+      "SG.Team1Picks",
+      "SG.Team2Picks",
+      "SG.Team1Bans",
+      "SG.Team2Bans",
+    ].join(","),
+    where: whereParts.join(" AND "),
+    order_by: "SG.DateTime_UTC DESC",
+    limit: "500",
+    format: "json",
+  });
+
+  const rows = parseCargoJsonRows(data);
+  if (rows.length === 0) {
+    console.log(`[Team][LP] No Leaguepedia games for ${lpTeamName} in "${tournamentName}"`);
+    console.log(
+      `::notice::[Team][LP] Zero results — check the Leaguepedia team name ("${lpTeamName}") and that the tournament exists on Leaguepedia (Grid and LP tournament names can differ)`,
+    );
+    await reportProgress({
+      step: "team",
+      status: "completed",
+      tournament: tournamentName,
+      source: "leaguepedia",
+      totalImported: 0,
+    });
+    return { importedGames: 0 };
+  }
+
+  console.log(`::notice::[Team][LP] Found ${rows.length} Leaguepedia games for ${lpTeamName} in "${tournamentName}"`);
+
+  let importedGames = 0;
+  for (const row of rows) {
+    const isTeam1 = row.Team1 === lpTeamName;
+    const gameDate = String(row["DateTime UTC"] || row.DateTime_UTC || "").slice(0, 10);
+    const gameId = row.GameId || "";
+    if (!gameDate || !gameId) continue;
+
+    const ourPicks = normalizeChampionList(row[isTeam1 ? "Team1Picks" : "Team2Picks"]);
+    const ourBans = normalizeChampionList(row[isTeam1 ? "Team1Bans" : "Team2Bans"]);
+    const oppPicks = normalizeChampionList(row[isTeam1 ? "Team2Picks" : "Team1Picks"]);
+    const oppBans = normalizeChampionList(row[isTeam1 ? "Team2Bans" : "Team1Bans"]);
+
+    // Team1 = Blue, Team2 = Red (Leaguepedia convention).
+    const bluePicks = normalizeChampionList(row.Team1Picks);
+    const redPicks = normalizeChampionList(row.Team2Picks);
+    const blueBans = normalizeChampionList(row.Team1Bans);
+    const redBans = normalizeChampionList(row.Team2Bans);
+
+    const winner = parseInt(row.Winner || 0);
+    const win = isTeam1 ? (winner === 1 ? 1 : 0) : winner === 2 ? 1 : 0;
+    const opponent = isTeam1 ? row.Team2 : row.Team1;
+
+    try {
+      await turso.execute({
+        sql: `INSERT OR IGNORE INTO team_games
+              (team_id, workspace_id, tournament, game_date, opponent, win, picks, bans, opp_picks, opp_bans, source, source_game_id,
+               blue_picks, red_picks, blue_bans, red_bans, blue_team, red_team, game_number, patch, duration)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leaguepedia', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          team.teamId,
+          WORKSPACE_ID,
+          tournamentName || row.Tournament || "Unknown",
+          gameDate,
+          opponent,
+          win,
+          JSON.stringify(ourPicks),
+          JSON.stringify(ourBans),
+          JSON.stringify(oppPicks),
+          JSON.stringify(oppBans),
+          gameId, // source_game_id — LP GameId, unique per game
+          JSON.stringify(bluePicks),
+          JSON.stringify(redPicks),
+          JSON.stringify(blueBans),
+          JSON.stringify(redBans),
+          row.Team1 || null,
+          row.Team2 || null,
+          parseGameNumber(gameId),
+          row.Patch != null ? String(row.Patch) : null,
+          parseGamelength(row.Gamelength),
+        ],
+      });
+      importedGames++;
+    } catch (err) {
+      if (!err.message.includes("UNIQUE"))
+        console.warn(`[Team][LP] team_games insert error: ${err.message}`);
+    }
+  }
+
+  console.log(`[Team][LP] Imported ${importedGames} Leaguepedia games for "${tournamentName}"`);
+  await reportProgress({
+    step: "team",
+    status: "completed",
+    tournament: tournamentName,
+    source: "leaguepedia",
+    totalImported: importedGames,
+  });
+
+  return { importedGames };
 }
 
 // ─── Step 5: Post-import aggregation ─────────────────────────────────
@@ -1148,11 +1495,16 @@ async function computeAggregates(turso, playerIds) {
 /**
  * Phase order (Sprint 5.3):
  *   1. op.gg SoloQ       (deprecated — will be removed in Sprint 6.1)
- *   2. Team Import (Grid)  — writes source='grid' rows in competitive_games
+ *   2. Team Import (Grid)  — writes source='grid' rows in competitive_games;
+ *                            falls back to Leaguepedia team import (source=
+ *                            'leaguepedia' team_games rows) when the team has
+ *                            no gridTeamId or a tournament has no Grid series
+ *                            (Sprint 5.6)
  *   3. Leaguepedia Competitive — writes source='leaguepedia' rows
  *   4. Riot API SoloQ     — per-game role-filtered soloQ data
  *   5. Aggregation        — no-op (raw-query architecture)
  *   6. Flag Computation   — single-player flags (comparative not yet wired)
+ *   7. Source Split Cache — scoutedPlayers/{pid}/sources (Sprint 5.5)
  *
  * Dual-source contract: Grid and Leaguepedia write to competitive_games
  * independently. They use different ID spaces (grid_game_id vs
@@ -1423,6 +1775,34 @@ async function main() {
     console.log("[Flags] Skipping flag computation (doFlags=false)");
   }
 
+  // ── Step 7: Source split cache (Sprint 5.5) ──────────────────────
+  // Writes scoutedPlayers/{playerId}/sources — the last-known Grid/LP
+  // source split per player. Pure cache for fast UI rendering; non-fatal.
+  if (options.doSourceSplits !== false) {
+    console.log("::group::Step 7: Source Split Cache");
+    try {
+      const { writePlayerSourceSplits } = require('./source-split.cjs');
+      const { getFirestore } = require('./firebase-admin');
+      const db = getFirestore();
+      const result = await writePlayerSourceSplits({
+        turso,
+        db,
+        workspaceId,
+        players,
+        scope: {
+          startDate: dataRange.startDate || null,
+          endDate: dataRange.endDate || null,
+        },
+      });
+      console.log(
+        `[SourceSplit] Wrote source splits for ${result.written}/${players.length} players`,
+      );
+    } catch (err) {
+      console.warn(`[SourceSplit] Skipped (non-fatal): ${err.message}`);
+    }
+    console.log("::endgroup::");
+  }
+
   // ── Single import_log row for the entire run ─────────────────────
   await logStep(
     turso,
@@ -1451,13 +1831,30 @@ async function main() {
   });
 }
 
-main().catch(async (error) => {
-  console.error("[Fatal]", error);
-  console.log("::endgroup::");
-  await reportProgress({ status: "failed", error: error.message }).catch(
-    () => {},
-  );
-  // Release Firestore lock on failure too
-  await releaseFirestoreLock().catch(() => {});
-  process.exit(1);
-});
+// ─── Exports (Sprint 5.4) ──────────────────────────────────────────────
+// The team-import functions are exported so the test harness can drive the
+// exact production code path without running main(). setChampionMapper is a
+// test hook that lets the harness exercise the mapper-based normalization
+// exactly like a real scan (main() initializes the mapper itself). When run
+// directly (CI workflow), main() executes as before.
+module.exports = {
+  importTeamData,
+  importTeamDataFromGrid,
+  importTeamDataFromLeaguepedia,
+  setChampionMapper(mapper) {
+    championMapper = mapper;
+  },
+};
+
+if (require.main === module) {
+  main().catch(async (error) => {
+    console.error("[Fatal]", error);
+    console.log("::endgroup::");
+    await reportProgress({ status: "failed", error: error.message }).catch(
+      () => {},
+    );
+    // Release Firestore lock on failure too
+    await releaseFirestoreLock().catch(() => {});
+    process.exit(1);
+  });
+}

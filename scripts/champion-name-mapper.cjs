@@ -165,12 +165,49 @@ class ChampionNameMapper {
       // 5. Display name normalized (lowercase, no special chars)
       variants.add(normalize(displayName));
 
-      // Map each variant to the canonical champion ID
+      // 6. Legacy champion key (e.g. "MonkeyKing" for Wukong, "KSante" for K'Sante)
+      //    Grid's Riot end-state files use the key as championName while
+      //    series-state character names use the champion ID — bridge both.
+      if (championData.key) {
+        variants.add(championData.key);
+        variants.add(championData.key.toLowerCase());
+        variants.add(normalize(championData.key));
+      }
+
+      // Map each variant to the canonical champion ID.
+      // First-wins EXCEPT that a plain champion always beats a "Jade_*"
+      // (Classic-mode) variant on display-name collisions: ddragon lists the
+      // 60 Classic champions (e.g. "Jade_Vayne") alphabetically before their
+      // plain counterparts ("Vayne") and they share the same display names,
+      // so without this rule "Vayne" would normalize to "Jade_Vayne".
       for (const variant of variants) {
         const existing = this._variantToId.get(variant);
-        if (!existing || existing === championId) {
+        const keepExisting =
+          existing &&
+          existing !== championId &&
+          !String(existing).startsWith("Jade_");
+        if (!keepExisting) {
           this._variantToId.set(variant, championId);
         }
+      }
+    }
+
+    // Unify the Classic-mode "Jade_*" champions with their plain counterparts.
+    // Grid/Riot data is inconsistent about which name it uses — even for
+    // non-Classic games (a series-state may say "Jade_Ezreal" while the
+    // end-state file says "Ezreal"). Champion identity is what matters for
+    // pool/matchup stats, so "Jade_Vayne" → "Vayne", "Jade_Wukong" →
+    // "MonkeyKing" (the plain Wukong id), etc.
+    for (const [variant, mapped] of [...this._variantToId.entries()]) {
+      if (!String(mapped).startsWith("Jade_") && !String(variant).startsWith("Jade_")) continue;
+      const baseKey = String(variant).startsWith("Jade_")
+        ? String(variant).slice(5)
+        : String(mapped).slice(5);
+      const base =
+        this._variantToId.get(baseKey) ||
+        this._variantToId.get(baseKey.toLowerCase());
+      if (base && !String(base).startsWith("Jade_")) {
+        this._variantToId.set(variant, base);
       }
     }
   }

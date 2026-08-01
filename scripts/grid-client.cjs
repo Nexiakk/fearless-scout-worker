@@ -142,7 +142,9 @@ async function fetchSeriesByTeamId(teamIds, options = {}) {
 }
 
 /**
- * Fetch draft data for a series — returns games with draftActions, teams.
+ * Fetch draft data for a series — returns games with draftActions, teams,
+ * and the per-game roster (GRID player IDs) used for participant matching
+ * (Sprint 5.4).
  */
 async function fetchSeriesDraftData(seriesId) {
   const query = `{
@@ -159,7 +161,13 @@ async function fetchSeriesDraftData(seriesId) {
           drafter { id type }
           draftable { id name type }
         }
-        teams { id name side won }
+        teams {
+          id
+          name
+          side
+          won
+          players { id name character { name } participationStatus }
+        }
       }
     }
   }`;
