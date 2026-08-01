@@ -928,8 +928,13 @@ function tournamentWindow(tournamentEntry, dataRange) {
  * No import-time dedup across sources: Grid and LP rows use different ID
  * spaces (source_game_id = grid game id vs LP GameId) and coexist; the
  * display layer dedups (same rule as competitive_games).
+ *
+ * @param {Object} [opts]
+ * @param {boolean} [opts.writePlayerGames=true] — pass through to the Grid
+ *   importer: per-player competitive rows follow the Player Competitive
+ *   toggle, not the Team toggle (user preference 2026-08-02).
  */
-async function importTeamData(turso, team, tournamentEntry) {
+async function importTeamData(turso, team, tournamentEntry, opts = {}) {
   const tournamentName = tournamentNameOf(tournamentEntry);
   console.log(`[Team] Importing tournament: ${tournamentName}`);
 
@@ -941,8 +946,11 @@ async function importTeamData(turso, team, tournamentEntry) {
       : null;
 
   // Resume guard — per-source: a grid-imported tournament doesn't block an
-  // LP entry for the same name, and vice versa.
-  if (await hasTeamData(turso, team.teamId, tournamentName, entrySource || undefined)) {
+  // LP entry for the same name, and vice versa. Only skip outright when NO
+  // per-player rows are wanted: if they are, re-run (INSERT OR IGNORE keeps
+  // team_games idempotent and backfills previously-missing player rows).
+  const needsPlayerRows = opts.writePlayerGames !== false;
+  if (!needsPlayerRows && await hasTeamData(turso, team.teamId, tournamentName, entrySource || undefined)) {
     console.log(`[Team] ${tournamentName} already imported (${entrySource || "any"}), skipping`);
     return { importedGames: 0, skipped: true };
   }
@@ -950,7 +958,7 @@ async function importTeamData(turso, team, tournamentEntry) {
   const gridEligible = !!team.gridTeamId && entrySource !== "leaguepedia";
 
   if (gridEligible) {
-    const result = await importTeamDataFromGrid(turso, team, tournamentEntry);
+    const result = await importTeamDataFromGrid(turso, team, tournamentEntry, opts);
     const gridGames = result.importedGames || 0;
     if (gridGames > 0) {
       return { importedGames: gridGames, importedPlayers: result.importedPlayers || 0 };
@@ -962,6 +970,10 @@ async function importTeamData(turso, team, tournamentEntry) {
     );
   }
 
+  // LP team drafts (team_games) are only wanted when the Team toggle is on.
+  if (opts.writeTeamGames === false) {
+    return { importedGames: 0 };
+  }
   const result = await importTeamDataFromLeaguepedia(turso, team, tournamentEntry);
   return { importedGames: result.importedGames || 0, source: "leaguepedia" };
 }
@@ -970,12 +982,25 @@ async function importTeamData(turso, team, tournamentEntry) {
  * Import team data from Grid.gg API.
  * Fetches series, draft data, and Riot summary files for the team's tournaments.
  *
+ * Two concerns, one fetch loop (no double downloads) — user preference
+ * 2026-08-02 (Player Competitive = Grid + Leaguepedia player rows; Team =
+ * team_games only):
+ *   - writeTeamGames   (default true)  → team_games rows. Bounded by the
+ *                                        per-tournament entry window ONLY
+ *                                        (tournaments are the Team control).
+ *   - writePlayerGames (default true)  → per-player competitive_games rows
+ *                                        (Grid source). Clipped to the Player
+ *                                        Competitive range (dataRange) — same
+ *                                        window as the Leaguepedia player rows.
+ *
  * Participant matching (Sprint 5.4): participants are matched to our scouted
  * players by exact gridPlayerId via the series-state roster, falling back to
  * normalized name matching. Grid rows additionally carry side_label,
  * grid_series_id/grid_game_id and a filled opponent_champion.
  */
-async function importTeamDataFromGrid(turso, team, tournamentEntry) {
+async function importTeamDataFromGrid(turso, team, tournamentEntry, opts = {}) {
+  const writeTeamGames = opts.writeTeamGames !== false;
+  const writePlayerGames = opts.writePlayerGames !== false;
   const tournamentName = tournamentNameOf(tournamentEntry);
   console.log(`[Grid] Importing ${team.teamName} from Grid.gg for tournament: ${tournamentName}`);
   await reportProgress({ step: "grid", status: "started", tournament: tournamentName });
@@ -983,17 +1008,23 @@ async function importTeamDataFromGrid(turso, team, tournamentEntry) {
   const grid = require("./grid-client.cjs");
   grid.initialize(championMapper);
 
-  const players = JSON.parse(PLAYERS_JSON);
+  // Read at call time (not module load) so test harnesses can vary the
+  // payload between calls; production env is identical either way.
+  const players = JSON.parse(process.env.PLAYERS_JSON || "[]");
 
-  // Fetch series for this team from Grid — scoped to the global dataRange
-  // intersected with the per-tournament window (dateStart/dateEnd).
-  const dataRange = JSON.parse(OPTIONS_JSON).dataRange || {};
-  const window = tournamentWindow(tournamentEntry, dataRange);
+  // Series fetch window = the tournament entry's dateStart/dateEnd ONLY
+  // (team_games are tournament-driven; the global competitive range only
+  // clips the per-player rows below).
+  const window = tournamentWindow(tournamentEntry, {});
   const options = {
     limit: 50,
   };
   if (window.startTimeGte) options.startTimeGte = window.startTimeGte;
   if (window.startTimeLte) options.startTimeLte = window.startTimeLte;
+
+  // Player Competitive range (Grid + Leaguepedia player rows share it).
+  const dataRange = JSON.parse(process.env.OPTIONS_JSON || "{}").dataRange || {};
+  const compStart = dataRange.type === "all-time" ? null : dataRange.startDate || null;
 
   const series = await grid.fetchSeriesByTeamId(team.gridTeamId, options);
   console.log(`[Grid] Found ${series.length} series for team ${team.teamName}`);
@@ -1072,45 +1103,56 @@ async function importTeamDataFromGrid(turso, team, tournamentEntry) {
         if (t.won) { winnerSide = t.side?.toLowerCase(); break; }
       }
 
-      // Insert into team_games
       const gameDate = s.startTimeScheduled ? s.startTimeScheduled.split('T')[0] : new Date().toISOString().split('T')[0];
-      try {
-        await turso.execute({
-          sql: `INSERT OR IGNORE INTO team_games 
-                (team_id, workspace_id, tournament, game_date, opponent, win, picks, bans, opp_picks, opp_bans, source, source_game_id,
-                 blue_picks, red_picks, blue_bans, red_bans, blue_team, red_team, draft_sequence, game_number, grid_series_id, grid_game_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'grid', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          args: [
-            team.teamId,
-            WORKSPACE_ID,
-            tournamentName || s.tournament?.name || "Unknown",
-            gameDate,
-            opponentName,
-            won,
-            JSON.stringify(ourPicks),
-            JSON.stringify(ourBans),
-            JSON.stringify(oppPicks),
-            JSON.stringify(oppBans),
-            String(game.id), // source_game_id — per-game id (was the series id,
-                             // which made INSERT OR IGNORE drop all but one game
-                             // per Bo3/Bo5 series — fixed in Sprint 5.6)
-            JSON.stringify(bluePicks),
-            JSON.stringify(redPicks),
-            JSON.stringify(blueBans),
-            JSON.stringify(redBans),
-            s.teams?.[0]?.baseInfo?.name || null,
-            s.teams?.[1]?.baseInfo?.name || null,
-            draftSequence,
-            game.sequenceNumber,
-            String(s.id),
-            game.id,
-          ],
-        });
-        importedGames++;
-      } catch (err) {
-        if (!err.message.includes("UNIQUE"))
-          console.warn(`[Grid] team_games insert error: ${err.message}`);
+
+      // Player Competitive clip: series scheduled before the competitive
+      // range start contribute NO per-player rows (team_games unaffected).
+      const inCompRange = !compStart || !s.startTimeScheduled || s.startTimeScheduled >= compStart;
+
+      // Insert into team_games (Team import — tournament-driven)
+      if (writeTeamGames) {
+        try {
+          await turso.execute({
+            sql: `INSERT OR IGNORE INTO team_games 
+                  (team_id, workspace_id, tournament, game_date, opponent, win, picks, bans, opp_picks, opp_bans, source, source_game_id,
+                   blue_picks, red_picks, blue_bans, red_bans, blue_team, red_team, draft_sequence, game_number, grid_series_id, grid_game_id)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'grid', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            args: [
+              team.teamId,
+              WORKSPACE_ID,
+              tournamentName || s.tournament?.name || "Unknown",
+              gameDate,
+              opponentName,
+              won,
+              JSON.stringify(ourPicks),
+              JSON.stringify(ourBans),
+              JSON.stringify(oppPicks),
+              JSON.stringify(oppBans),
+              String(game.id), // source_game_id — per-game id (was the series id,
+                               // which made INSERT OR IGNORE drop all but one game
+                               // per Bo3/Bo5 series — fixed in Sprint 5.6)
+              JSON.stringify(bluePicks),
+              JSON.stringify(redPicks),
+              JSON.stringify(blueBans),
+              JSON.stringify(redBans),
+              s.teams?.[0]?.baseInfo?.name || null,
+              s.teams?.[1]?.baseInfo?.name || null,
+              draftSequence,
+              game.sequenceNumber,
+              String(s.id),
+              game.id,
+            ],
+          });
+          importedGames++;
+        } catch (err) {
+          if (!err.message.includes("UNIQUE"))
+            console.warn(`[Grid] team_games insert error: ${err.message}`);
+        }
       }
+
+      // Summary file: needed for the team_games duration/roles update AND for
+      // per-player rows. Skipped only when neither is wanted for this game.
+      if (!writeTeamGames && !(writePlayerGames && inCompRange)) continue;
 
       // Download Riot summary file for participant data
       await sleep(1500);
@@ -1137,20 +1179,26 @@ async function importTeamDataFromGrid(turso, team, tournamentEntry) {
         .filter(Boolean);
 
       // Update team_games row with duration and role data
-      try {
-        await turso.execute({
-          sql: `UPDATE team_games SET duration = ?, blue_roles = ?, red_roles = ? WHERE grid_series_id = ? AND grid_game_id = ?`,
-          args: [
-            summaryData.gameDuration ? Math.round(summaryData.gameDuration) : null,
-            JSON.stringify(blueRoles),
-            JSON.stringify(redRoles),
-            String(s.id),
-            game.id,
-          ],
-        });
-      } catch (err) {
-        console.warn(`[Grid] team_games update error: ${err.message}`);
+      if (writeTeamGames) {
+        try {
+          await turso.execute({
+            sql: `UPDATE team_games SET duration = ?, blue_roles = ?, red_roles = ? WHERE grid_series_id = ? AND grid_game_id = ?`,
+            args: [
+              summaryData.gameDuration ? Math.round(summaryData.gameDuration) : null,
+              JSON.stringify(blueRoles),
+              JSON.stringify(redRoles),
+              String(s.id),
+              game.id,
+            ],
+          });
+        } catch (err) {
+          console.warn(`[Grid] team_games update error: ${err.message}`);
+        }
       }
+
+      // Per-player rows (Player Competitive — Grid source, clipped to the
+      // competitive range).
+      if (!writePlayerGames || !inCompRange) continue;
 
       // Match participants to stored players: exact gridPlayerId via the
       // series-state roster first, normalized name match as fallback.
@@ -1313,8 +1361,9 @@ function parseGameNumber(gameId) {
  * Import team drafts from Leaguepedia (ScoreboardGames) — the fallback for
  * tournaments Grid.gg doesn't cover (no gridTeamId, or no Grid series found).
  *
- * Scoped to the tournament entry name intersected with the global dataRange
- * (tournamentWindow applies the per-entry dateStart/dateEnd clipping — §2.2).
+ * Scoped to the tournament entry name + the per-tournament dateStart/dateEnd
+ * (tournamentWindow with an empty global range — team drafts are
+ * tournament-driven, §2.2; the competitive range does NOT clip team_games).
  * Writes team_games rows with source='leaguepedia' and source_game_id = LP's
  * GameId (unique per game). No import-time dedup vs Grid rows — the display
  * layer dedups across sources (same rule as competitive_games).
@@ -1360,9 +1409,9 @@ async function importTeamDataFromLeaguepedia(turso, team, tournamentEntry) {
     return { importedGames: 0, skipped: true };
   }
 
-  // Scope: global dataRange intersected with the per-tournament window.
-  const dataRange = JSON.parse(OPTIONS_JSON).dataRange || {};
-  const window = tournamentWindow(tournamentEntry, dataRange);
+  // Scope: per-tournament entry window ONLY (team drafts are tournament-
+  // driven — the global competitive range does not clip team_games).
+  const window = tournamentWindow(tournamentEntry, {});
 
   const safeName = lpTeamName.replace(/"/g, '\\"');
   const safeTournament = tournamentName.replace(/"/g, '\\"');
@@ -1495,11 +1544,14 @@ async function computeAggregates(turso, playerIds) {
 /**
  * Phase order (Sprint 5.3):
  *   1. op.gg SoloQ       (deprecated — will be removed in Sprint 6.1)
- *   2. Team Import (Grid)  — writes source='grid' rows in competitive_games;
- *                            falls back to Leaguepedia team import (source=
- *                            'leaguepedia' team_games rows) when the team has
- *                            no gridTeamId or a tournament has no Grid series
- *                            (Sprint 5.6)
+ *   2. Team Import (Grid)  — team_games rows (drafts) from Grid, falling back
+ *                            to Leaguepedia team drafts when the team has no
+ *                            gridTeamId or a tournament has no Grid series
+ *                            (Sprint 5.6). Also writes Grid per-player
+ *                            competitive rows when Player Competitive is ON.
+ *                            Tournament-driven (entry windows only).
+ *   2b. Grid Player Competitive — Grid per-player competitive rows when
+ *                            Player Competitive is ON and Team is OFF.
  *   3. Leaguepedia Competitive — writes source='leaguepedia' rows
  *   4. Riot API SoloQ     — per-game role-filtered soloQ data
  *   5. Aggregation        — no-op (raw-query architecture)
@@ -1514,11 +1566,14 @@ async function computeAggregates(turso, playerIds) {
  *
  * Scope windows (user preference 2026-08-02, supersedes the Sprint 5.3
  * 12-month default):
- *   - OPTIONS_JSON.dataRange       → Grid team import + Leaguepedia
- *                                   competitive. No bounds = ALL TIME.
+ *   - OPTIONS_JSON.dataRange       → per-player competitive rows from BOTH
+ *                                   sources (Grid + Leaguepedia). No bounds
+ *                                   = ALL TIME.
  *   - OPTIONS_JSON.soloqDataRange  → Riot API SoloQ only. Falls back to
  *                                   dataRange, then to the current season
  *                                   (Jan 1 of this year).
+ *   - Team import (team_games)     → per-tournament entry windows only
+ *                                   (selectedTournaments dateStart/dateEnd).
  * Presets resolve to concrete startDate/endDate client-side; the worker only
  * understands bounds and { type: 'all-time' }.
  */
@@ -1572,7 +1627,7 @@ async function main() {
     ? Math.floor(new Date(soloqEnd).getTime() / 1000)
     : null;
   console.log(
-    `[Scope] Grid/LP window: ${dataStart || "ALL TIME"} → ${dataEnd || "now"} · SoloQ window: ${soloqStart || "ALL TIME"} → ${soloqEnd || "now"}`,
+    `[Scope] Competitive (G+LP player) window: ${dataStart || "ALL TIME"} → ${dataEnd || "now"} · SoloQ window: ${soloqStart || "ALL TIME"} → ${soloqEnd || "now"} · Team import: per-tournament windows`,
   );
 
   // Track total games across all steps for a single import_log row at the end
@@ -1610,10 +1665,10 @@ async function main() {
     }
   }
 
-  // ── Step 2: Team Import (Grid) — runs BEFORE competitive so the
-  //    Grid import writes source='grid' rows first; LP only adds
-  //    source='leaguepedia' rows for games Grid doesn't cover.
-  //    (Sprint 5.3 phase reorder)
+  // ── Step 2: Team Import — team_games (drafts) only when doTeam is on.
+  //    Grid also writes per-player competitive rows here when Player
+  //    Competitive is ON (writePlayerGames). Runs BEFORE the LP competitive
+  //    step so Grid rows land first (Sprint 5.3 phase reorder).
   console.log("::endgroup::");
   console.log("::group::Step 2: Team Import");
   if (options.doTeam && team.teamId && team.selectedTournaments?.length > 0) {
@@ -1622,20 +1677,57 @@ async function main() {
       await reportProgress({ step: "team", status: "started" });
 
       let totalImported = 0;
+      let totalPlayerEntries = 0;
       for (const tournament of team.selectedTournaments) {
         await reportProgress({ step: "team", tournament });
-        const result = await importTeamData(turso, team, tournament);
+        const result = await importTeamData(turso, team, tournament, {
+          writePlayerGames: options.doCompetitive !== false,
+        });
         totalImported += result.importedGames || 0;
+        totalPlayerEntries += result.importedPlayers || 0;
       }
       totalGamesAllSteps += totalImported;
       await reportProgress({
         step: "team",
         status: "completed",
         totalImported,
+        totalPlayerEntries,
       });
     } else {
       console.log("[Resume] Team import already complete, skipping");
     }
+  }
+
+  // ── Step 2b: Grid Player Competitive — per-player competitive rows from
+  //    Grid when Player Competitive is ON and Team is OFF (full re-gate,
+  //    user preference 2026-08-02). Player rows are clipped to the
+  //    competitive range inside importTeamDataFromGrid.
+  console.log("::endgroup::");
+  console.log("::group::Step 2b: Grid Player Competitive");
+  if (
+    options.doCompetitive &&
+    !options.doTeam &&
+    team.teamId &&
+    team.gridTeamId &&
+    team.selectedTournaments?.length > 0
+  ) {
+    console.log("\n=== Step 2b: Grid Player Competitive ===");
+    await reportProgress({ step: "grid", status: "started", subStep: "player-competitive" });
+
+    let totalPlayerEntries = 0;
+    for (const tournament of team.selectedTournaments) {
+      const result = await importTeamDataFromGrid(turso, team, tournament, {
+        writeTeamGames: false,
+        writePlayerGames: true,
+      });
+      totalPlayerEntries += result.importedPlayers || 0;
+    }
+    await reportProgress({
+      step: "grid",
+      status: "completed",
+      subStep: "player-competitive",
+      totalPlayerEntries,
+    });
   }
 
   // ── Step 3: Leaguepedia Competitive ──────────────────────────────
