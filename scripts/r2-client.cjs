@@ -125,6 +125,7 @@ async function headObject(key) {
     contentType: res.headers.get("content-type"),
     contentEncoding: res.headers.get("content-encoding"),
     cacheControl: res.headers.get("cache-control"),
+    contentLength: parseInt(res.headers.get("content-length") || "0", 10) || null,
   };
 }
 

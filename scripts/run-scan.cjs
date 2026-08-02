@@ -54,7 +54,28 @@ const CALLBACK_URL = process.env.CALLBACK_URL || "";
 const MAX_RETRIES = 5;
 const LEAGUEPEDIA_BASE = "https://lol.fandom.com/wiki/Special:CargoExport";
 
-if (!TURSO_URL || !JOB_ID || !WORKSPACE_ID) {
+// ─── `--inspect-events <seriesId> <gameNumber>` dev tool (Sprint 7.1) ───
+// Streams the first ~500 in-game lines of one real Grid events file:
+// type histogram, coordinate ranges, samples per kind, and confirmation
+// that 1 Hz full-state ticks are present. Runs BEFORE the env validation
+// below so it works with only GRID_API_KEY set.
+const INSPECT_EVENTS_INDEX = process.argv.indexOf("--inspect-events");
+if (require.main === module && INSPECT_EVENTS_INDEX !== -1) {
+  const seriesId = process.argv[INSPECT_EVENTS_INDEX + 1];
+  const gameNumber = process.argv[INSPECT_EVENTS_INDEX + 2];
+  if (!seriesId || !gameNumber) {
+    console.error(
+      "Usage: node run-scan.cjs --inspect-events <gridSeriesId> <gridGameNumber>",
+    );
+    process.exit(1);
+  }
+  runInspectEvents(seriesId, gameNumber)
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error(`[Inspect] Failed: ${error.message}`);
+      process.exit(1);
+    });
+} else if (!TURSO_URL || !JOB_ID || !WORKSPACE_ID) {
   console.error(
     "[Fatal] Missing required env vars: TURSO_URL, JOB_ID, WORKSPACE_ID",
   );
@@ -103,6 +124,130 @@ function normalizeChampionName(name) {
   const championId = championMapper.toChampionId(name);
   // Get display name if we have it, otherwise return the normalized ID
   return championMapper.getDisplayName(championId) || championId;
+}
+
+// ─── Stage label mapping ──────────────────────────────────────────────
+
+/**
+ * `--inspect-events <seriesId> <gameNumber>` — streams the first 500
+ * in-game lines of one real Grid events file and reports a type histogram,
+ * coordinate ranges, samples per kind, and whether 1 Hz full-state ticks
+ * are present. Hard prerequisite gate for Sprint 7.1 (see docs).
+ */
+async function runInspectEvents(seriesId, gameNumber) {
+  const grid = require("./grid-client.cjs");
+  const { classifyLine } = require("./parseEventsToAggregate.cjs");
+  const readline = require("readline");
+
+  const download = await grid.downloadEventsJsonl(seriesId, gameNumber);
+  if (!download) {
+    console.log(`[Inspect] No events file for series ${seriesId} game ${gameNumber}`);
+    return;
+  }
+  console.log(
+    `[Inspect] Streaming events for series ${seriesId} game ${gameNumber} (${download.contentLength} bytes)`,
+  );
+
+  const rl = readline.createInterface({ input: download.stream, crlfDelay: Infinity });
+  const kindCounts = {};
+  const schemaCounts = {};
+  const unknownSchemas = {};
+  const samples = {};
+  const ranges = { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity };
+  const phases = { CHAMP_SELECT: 0, POST_CHAMP_SELECT: 0, IN_GAME: 0 };
+  let total = 0;
+  let inGame = 0;
+  let tickLines = 0;
+  let unknown = 0;
+  const tickSeconds = new Set();
+
+  const extendRange = (pos) => {
+    if (!pos || typeof pos.x !== "number") return;
+    const z = typeof pos.z === "number" ? pos.z : pos.y;
+    if (typeof z !== "number") return;
+    ranges.minX = Math.min(ranges.minX, pos.x);
+    ranges.maxX = Math.max(ranges.maxX, pos.x);
+    ranges.minZ = Math.min(ranges.minZ, z);
+    ranges.maxZ = Math.max(ranges.maxZ, z);
+  };
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    total++;
+    let j;
+    try {
+      j = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (j.gameState === "CHAMP_SELECT" || j.gameState === "POST_CHAMP_SELECT") {
+      phases[j.gameState]++;
+      schemaCounts[j.gameState] = (schemaCounts[j.gameState] || 0) + 1;
+      continue;
+    }
+    schemaCounts[j.rfc461Schema || "?"] = (schemaCounts[j.rfc461Schema || "?"] || 0) + 1;
+    phases.IN_GAME++;
+
+    const { kind, data } = classifyLine(j);
+    kindCounts[kind] = (kindCounts[kind] || 0) + 1;
+    if (kind === "unknown") {
+      unknown++;
+      unknownSchemas[j.rfc461Schema || "?"] = (unknownSchemas[j.rfc461Schema || "?"] || 0) + 1;
+    }
+    if (kind === "tick") {
+      tickLines++;
+      if (typeof data.t === "number") tickSeconds.add(Math.floor(data.t / 1000));
+      for (const p of data.participants || []) {
+        extendRange(p && p.position);
+      }
+      if (!samples[kind]) {
+        const first = data.participants && data.participants[0];
+        samples[kind] = first && first.position
+          ? `participants=${data.participants.length}, first pos=${JSON.stringify(first.position)}, hp=${first.health}/${first.healthMax}, alive=${first.alive}`
+          : `participants=${data.participants && data.participants.length}, no positions on game-start line`;
+      }
+    } else {
+      if (data && data.position) extendRange(data.position);
+      if (!samples[kind]) {
+        const { position, ...rest } = data || {};
+        samples[kind] = JSON.stringify(rest).slice(0, 200);
+      }
+    }
+    inGame++;
+    if (inGame >= 500) break;
+  }
+
+  console.log(`\n[Inspect] total lines: ${total} (in-game scanned: ${inGame}, 500 cap)`);
+  console.log(`[Inspect] phases: CHAMP_SELECT=${phases.CHAMP_SELECT}, POST_CHAMP_SELECT=${phases.POST_CHAMP_SELECT}, in-game=${phases.IN_GAME}`);
+  console.log(
+    `[Inspect] kinds: ${Object.entries(kindCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, n]) => `${k}=${n}`)
+      .join(", ")}`,
+  );
+  const topSchemas = Object.entries(schemaCounts).sort((a, b) => b[1] - a[1]).slice(0, 8);
+  if (topSchemas.length) {
+    console.log(`[Inspect] rfc461Schemas: ${topSchemas.map(([s, n]) => `${s}=${n}`).join(", ")}`);
+  }
+  if (Number.isFinite(ranges.minX)) {
+    console.log(`[Inspect] coordinates: x [${Math.round(ranges.minX)}, ${Math.round(ranges.maxX)}], z [${Math.round(ranges.minZ)}, ${Math.round(ranges.maxZ)}]`);
+  }
+  const confirmed = tickLines > 0 && tickSeconds.size > 0;
+  console.log(
+    `[Inspect] ticks: ${tickLines} full-state lines, ${tickSeconds.size} unique integer seconds → 1 Hz state ticks ${confirmed ? "CONFIRMED" : "NOT FOUND"}`,
+  );
+  if (unknown > 0) {
+    console.log(`[Inspect] unknown lines: ${unknown}`);
+    console.log(
+      `[Inspect] unknown by schema: ${Object.entries(unknownSchemas)
+        .sort((a, b) => b[1] - a[1])
+        .map(([s, n]) => `${s}=${n}`)
+        .join(", ")}`,
+    );
+  }
+  for (const [kind, sample] of Object.entries(samples)) {
+    console.log(`[Inspect] sample ${kind}: ${sample}`);
+  }
 }
 
 // ─── Stage label mapping ──────────────────────────────────────────────
@@ -891,6 +1036,316 @@ async function scanCompetitive(turso, player, startDate, endDate) {
   return { gamesImported: totalImported };
 }
 
+// ─── Sprint 7.1: per-game events JSONL helpers ─────────────────────────
+
+/**
+ * Single-statement upsert for grid_events_files. The previous
+ * SELECT-then-INSERT-or-UPDATE was racy — two concurrent scans could both
+ * see "no row" and both INSERT (one hits the UNIQUE(grid_series_id,
+ * grid_game_id) violation) or interleave reads/writes. SQLite/libsql
+ * supports `ON CONFLICT ... DO UPDATE`, which resolves the conflict in one
+ * atomic statement. The column set and updated fields match the old
+ * INSERT + UPDATE exactly, plus `game_date` which the old UPDATE branch
+ * (unlike the INSERT) omitted.
+ */
+async function upsertEventsFileRow(turso, fields) {
+  const { seriesId, gridGameId } = fields;
+  const wsId = fields.workspaceId || WORKSPACE_ID;
+  await turso.execute({
+    sql: `INSERT INTO grid_events_files
+          (workspace_id, grid_series_id, grid_game_id, r2_key, status, raw_size_bytes, gutted_size_bytes, event_count, game_date, duration, patch, tournament, team_id, blue_team, red_team, blue_team_id, red_team_id, side_summary, downloaded_at, parsed_at, error_message)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(workspace_id, grid_series_id, grid_game_id) DO UPDATE SET
+            r2_key = excluded.r2_key,
+            status = excluded.status,
+            raw_size_bytes = excluded.raw_size_bytes,
+            gutted_size_bytes = excluded.gutted_size_bytes,
+            event_count = excluded.event_count,
+            game_date = excluded.game_date,
+            duration = excluded.duration,
+            patch = excluded.patch,
+            tournament = excluded.tournament,
+            team_id = excluded.team_id,
+            blue_team = excluded.blue_team,
+            red_team = excluded.red_team,
+            blue_team_id = excluded.blue_team_id,
+            red_team_id = excluded.red_team_id,
+            side_summary = excluded.side_summary,
+            downloaded_at = excluded.downloaded_at,
+            parsed_at = excluded.parsed_at,
+            error_message = excluded.error_message`,
+    args: [
+      wsId,
+      seriesId,
+      gridGameId,
+      fields.r2Key || null,
+      fields.status || "downloaded",
+      fields.rawSizeBytes ?? null,
+      fields.guttedSizeBytes ?? null,
+      fields.eventCount ?? null,
+      fields.gameDate || null,
+      fields.duration ?? null,
+      fields.patch || null,
+      fields.tournament || null,
+      fields.teamId || null,
+      fields.blueTeam || null,
+      fields.redTeam || null,
+      fields.blueTeamId || null,
+      fields.redTeamId || null,
+      fields.sideSummary ? JSON.stringify(fields.sideSummary) : null,
+      fields.downloadedAt || null,
+      fields.parsedAt || null,
+      fields.errorMessage || null,
+    ],
+  });
+}
+
+/**
+ * Download + parse + upload one game's events JSONL, then record the
+ * grid_events_files row. Returns 'skipped' (already parsed), 'no-file'
+ * (Grid has no events file for this game), or the processGameEvents result.
+ */
+async function processEventsFileForGame({
+  turso,
+  seriesId,
+  gameNumber,
+  gridGameId,
+  team,
+  tournamentName,
+  gameDate,
+  blueTeam,
+  redTeam,
+  blueTeamId,
+  redTeamId,
+  bluePicks,
+  redPicks,
+  winnerSide,
+}) {
+  // Read the existing row ONCE: status drives the skip-if-parsed resume
+  // check, and r2_key is needed to clean up a stale object when Grid
+  // renumbers a game (the key embeds the sequence number — see
+  // parseEventsToGutted.cjs r2Key()). A changed sequence number yields a
+  // NEW key and would otherwise leak the old object.
+  const existing = await turso.execute({
+    sql: `SELECT status, r2_key FROM grid_events_files WHERE workspace_id = ? AND grid_series_id = ? AND grid_game_id = ?`,
+    args: [WORKSPACE_ID, seriesId, gridGameId],
+  });
+  const existingRow = existing.rows[0]
+    ? rowToObject(existing.rows[0], existing.columns)
+    : null;
+  if (existingRow?.status === "parsed") return "skipped";
+
+  const grid = require("./grid-client.cjs");
+  const { processGameEvents } = require("./parseEventsToGutted.cjs");
+
+  const download = await grid.downloadEventsJsonl(seriesId, gameNumber);
+  if (!download) return "no-file";
+
+  const downloadedAt = new Date().toISOString();
+  const result = await processGameEvents({
+    stream: download.stream,
+    seriesId,
+    gameNumber,
+    workspaceId: WORKSPACE_ID,
+    meta: { bluePicks, redPicks, winnerSide, blueTeam, redTeam, blueTeamId, redTeamId },
+  });
+
+  // R2 key changed for the same (seriesId, gridGameId) — Grid renumbered the
+  // game's sequence number. Delete the stale object best-effort (non-fatal).
+  if (existingRow?.r2_key && existingRow.r2_key !== result.r2Key) {
+    try {
+      const r2 = require("./r2-client.cjs");
+      await r2.deleteObject(existingRow.r2_key);
+      console.log(
+        `[Events] Removed stale R2 object (renumbered game): ${existingRow.r2_key} → ${result.r2Key}`,
+      );
+    } catch (err) {
+      console.warn(`[Events] Stale R2 delete failed (non-fatal): ${err.message}`);
+    }
+  }
+
+  await upsertEventsFileRow(turso, {
+    seriesId,
+    gridGameId,
+    r2Key: result.r2Key,
+    status: "parsed",
+    rawSizeBytes: result.rawSizeBytes,
+    guttedSizeBytes: result.guttedSizeBytes,
+    eventCount: result.eventCount,
+    gameDate,
+    duration: result.duration ? Math.round(result.duration / 1000) : null,
+    patch: result.patch,
+    tournament: tournamentName,
+    teamId: team.teamId,
+    blueTeam,
+    redTeam,
+    blueTeamId,
+    redTeamId,
+    sideSummary: result.sideSummary,
+    downloadedAt,
+    parsedAt: new Date().toISOString(),
+  });
+  return result;
+}
+
+// ─── Sprint 7.1: per-team patterns rollup (scoutedTeams/{id}/patternsSummary) ──
+
+const R2_PUBLIC_BASE_URL =
+  process.env.R2_PUBLIC_BASE_URL || "https://fearless-events-cdn.mietplaytv.workers.dev";
+
+/**
+ * Fetch a gutted JSONL and return its computed blocks.
+ * @returns {Promise<{cheeseFlags: Array, lvl1: object, jungle: Array, heat: object, meta: object}|null>}
+ */
+async function fetchGuttedBlocks(r2Key) {
+  const url = `${R2_PUBLIC_BASE_URL.replace(/\/+$/, "")}/${r2Key}`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`GET ${res.status}`);
+      const text = await res.text();
+      const blocks = { cheeseFlags: [], lvl1: null, jungle: [], heat: null, meta: null };
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        let j;
+        try {
+          j = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (j.k === "cheese") blocks.cheeseFlags = j.flags || [];
+        else if (j.k === "lvl1") blocks.lvl1 = j.clusters || null;
+        else if (j.k === "jungle") blocks.jungle = j.patterns || [];
+        else if (j.k === "heat") blocks.heat = j.g || null;
+        else if (j.meta) blocks.meta = j.meta || null;
+      }
+      return blocks;
+    } catch (err) {
+      if (attempt === 1) throw err;
+      await sleep(1500);
+    }
+  }
+  return null;
+}
+
+/**
+ * Normalize a libsql row to a plain object. The worker's @libsql/client
+ * v0.14 returns array-like rows (index + named props); the root package's
+ * v1 client returns plain objects with toJSON(). Works with both.
+ */
+function rowToObject(row, columns) {
+  if (!row) return null;
+  if (row.toJSON) return row.toJSON();
+  if (Array.isArray(row)) {
+    return Object.fromEntries(row.map((c, i) => [columns?.[i], c?.value]));
+  }
+  return row;
+}
+
+/**
+ * Aggregate the parsed games of one team into the workspace-scoped
+ * workspaces/{workspaceId}/scoutedTeams/{teamId}/patternsSummary Firestore
+ * doc (~50 KB; the §2.5 shorthand `scoutedTeams/{teamId}` is the nested
+ * path without the workspace prefix): cross-game cheese counts, lvl1
+ * cluster centroids, jungle pattern distribution, heatmap overlay. Non-fatal.
+ */
+async function writeTeamPatternsRollup({ turso, team }) {
+  const db = await getFirestoreDb();
+  if (!db) return { written: false, reason: "no-firestore" };
+
+  const res = await turso.execute({
+    sql: `SELECT grid_series_id, grid_game_id, r2_key, game_date, duration, patch, event_count
+          FROM grid_events_files
+          WHERE workspace_id = ? AND team_id = ? AND status = 'parsed'`,
+    args: [WORKSPACE_ID, team.teamId],
+  });
+  const rows = res.rows.map((r) => rowToObject(r, res.columns));
+  if (rows.length === 0) return { written: false, reason: "no-parsed-games" };
+
+  const cheeseCounts = {};
+  const jungleDistribution = {};
+  const lvl1Centroids = { blue: { x: 0, z: 0, weight: 0 }, red: { x: 0, z: 0, weight: 0 } };
+  const overlay = { blue: new Array(1024).fill(0), red: new Array(1024).fill(0), vision: new Array(1024).fill(0), kills: new Array(1024).fill(0) };
+  const gameList = [];
+
+  // Concurrency-4 fetch + aggregate.
+  for (let i = 0; i < rows.length; i += 4) {
+    const batch = rows.slice(i, i + 4);
+    const blocksList = await Promise.all(batch.map((r) => fetchGuttedBlocks(r.r2_key)));
+    batch.forEach((row, j) => {
+      const blocks = blocksList[j];
+      if (!blocks) return;
+      for (const flag of blocks.cheeseFlags) {
+        cheeseCounts[flag.type] = (cheeseCounts[flag.type] || 0) + 1;
+      }
+      for (const pattern of blocks.jungle) {
+        jungleDistribution[pattern.label] = (jungleDistribution[pattern.label] || 0) + 1;
+      }
+      for (const side of ["blue", "red"]) {
+        const clusters = blocks.lvl1 && blocks.lvl1[side];
+        if (!clusters) continue;
+        for (const c of clusters) {
+          lvl1Centroids[side].x += c.x * c.count;
+          lvl1Centroids[side].z += c.z * c.count;
+          lvl1Centroids[side].weight += c.count;
+        }
+      }
+      if (blocks.heat) {
+        for (const grid of ["blue", "red", "vision", "kills"]) {
+          const arr = blocks.heat[grid];
+          if (!arr) continue;
+          for (let k = 0; k < 1024; k++) overlay[grid][k] += arr[k] || 0;
+        }
+      }
+      gameList.push({
+        seriesId: row.grid_series_id,
+        gameNumber: row.grid_game_id,
+        gameDate: row.game_date,
+        duration: row.duration,
+        patch: row.patch,
+        eventCount: row.event_count,
+        cheeseFlags: blocks.cheeseFlags.length,
+        r2Key: row.r2_key,
+      });
+    });
+  }
+
+  const lvl1Clusters = {
+    blue: lvl1Centroids.blue.weight > 0
+      ? { x: Math.round(lvl1Centroids.blue.x / lvl1Centroids.blue.weight), z: Math.round(lvl1Centroids.blue.z / lvl1Centroids.blue.weight), games: rows.length }
+      : null,
+    red: lvl1Centroids.red.weight > 0
+      ? { x: Math.round(lvl1Centroids.red.x / lvl1Centroids.red.weight), z: Math.round(lvl1Centroids.red.z / lvl1Centroids.red.weight), games: rows.length }
+      : null,
+  };
+
+  const docData = {
+    workspaceId: WORKSPACE_ID,
+    teamId: team.teamId,
+    teamName: team.teamName || null,
+    gamesCount: gameList.length,
+    computedAt: new Date().toISOString(),
+    cheeseCounts,
+    lvl1Clusters,
+    jungleDistribution,
+    heatmapOverlay: overlay,
+    gameList,
+  };
+
+  const { getAdmin } = require("./firebase-admin.js");
+  await db
+    .collection("workspaces")
+    .doc(WORKSPACE_ID)
+    .collection("scoutedTeams")
+    .doc(String(team.teamId))
+    .set({
+      ...docData,
+      computedAt: getAdmin().firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+  return { written: true, gamesCount: gameList.length, docBytes: JSON.stringify(docData).length };
+}
+
 // ─── Step 4: Team Import ──────────────────────────────────────────────
 
 async function getTursoClient(dbName) {
@@ -997,6 +1452,37 @@ async function importTeamData(turso, team, tournamentEntry, opts = {}) {
 }
 
 /**
+ * Resolve the per-game blue/red side teams from the per-game `game.teams`
+ * list (entries: { id, name, side, won, ... }).
+ *
+ * Grid's series-level `s.teams` array order is NOT a reliable side
+ * indicator — red is sometimes listed first — so blue/red derived from
+ * `s.teams[0]`/`s.teams[1]` can be swapped (this broke the Threats tab's
+ * team attribution and the Side filter). `game.teams[].side` IS the actual
+ * per-game side. Falls back to the series array order when per-game side
+ * fields are unavailable (older payloads / test fixtures).
+ */
+function resolveGameSides(game, seriesTeams) {
+  const toSide = (t) => String(t?.side || "").toLowerCase();
+  const blue = (game.teams || []).find((t) => toSide(t) === "blue");
+  const red = (game.teams || []).find((t) => toSide(t) === "red");
+  if (blue || red) {
+    return {
+      blueTeam: blue?.name || blue?.baseInfo?.name || null,
+      redTeam: red?.name || red?.baseInfo?.name || null,
+      blueTeamId: blue?.id ? String(blue.id) : blue?.baseInfo?.id ? String(blue.baseInfo.id) : null,
+      redTeamId: red?.id ? String(red.id) : red?.baseInfo?.id ? String(red.baseInfo.id) : null,
+    };
+  }
+  return {
+    blueTeam: seriesTeams?.[0]?.baseInfo?.name || null,
+    redTeam: seriesTeams?.[1]?.baseInfo?.name || null,
+    blueTeamId: seriesTeams?.[0]?.baseInfo?.id ? String(seriesTeams[0].baseInfo.id) : null,
+    redTeamId: seriesTeams?.[1]?.baseInfo?.id ? String(seriesTeams[1].baseInfo.id) : null,
+  };
+}
+
+/**
  * Import team data from Grid.gg API.
  * Fetches series, draft data, and Riot summary files for the team's tournaments.
  *
@@ -1019,6 +1505,7 @@ async function importTeamData(turso, team, tournamentEntry, opts = {}) {
 async function importTeamDataFromGrid(turso, team, tournamentEntry, opts = {}) {
   const writeTeamGames = opts.writeTeamGames !== false;
   const writePlayerGames = opts.writePlayerGames !== false;
+  const writeEvents = opts.writeEvents !== false;
   const tournamentName = tournamentNameOf(tournamentEntry);
   console.log(`[Grid] Importing ${team.teamName} from Grid.gg for tournament: ${tournamentName}`);
   await reportProgress({ step: "grid", status: "started", tournament: tournamentName });
@@ -1056,6 +1543,7 @@ async function importTeamDataFromGrid(turso, team, tournamentEntry, opts = {}) {
 
   let importedGames = 0;
   let importedPlayers = 0;
+  let eventsGames = 0;
   const seriesFound = filteredSeries.length;
 
   for (const s of filteredSeries) {
@@ -1121,11 +1609,70 @@ async function importTeamDataFromGrid(turso, team, tournamentEntry, opts = {}) {
         if (t.won) { winnerSide = t.side?.toLowerCase(); break; }
       }
 
+      // Blue/red attribution from the per-game `game.teams[].side` field
+      // (NOT the series-level `s.teams` array order, which Grid sometimes
+      // lists red-first — see resolveGameSides).
+      const sides = resolveGameSides(game, s.teams);
+
       const gameDate = s.startTimeScheduled ? s.startTimeScheduled.split('T')[0] : new Date().toISOString().split('T')[0];
 
       // Player Competitive clip: series scheduled before the competitive
       // range start contribute NO per-player rows (team_games unaffected).
       const inCompRange = !compStart || !s.startTimeScheduled || s.startTimeScheduled >= compStart;
+
+      // ── Events JSONL sub-step (Sprint 7.1) ───────────────────────────
+      // Tournament-driven like team_games (not clipped by the competitive
+      // range): downloads the per-game events stream, parses it into the
+      // gutted+enriched JSONL, PUTs it to R2, records a grid_events_files
+      // row. Skip-if-`status='parsed'` (resume). Non-fatal: a failed game
+      // records status='failed' and is retried on the next scan.
+      if (writeEvents) {
+        try {
+          const evResult = await processEventsFileForGame({
+            turso,
+            seriesId: String(s.id),
+            gameNumber: game.sequenceNumber,
+            gridGameId: String(game.id),
+            team,
+            tournamentName: tournamentName || s.tournament?.name || "Unknown",
+            gameDate,
+            blueTeam: sides.blueTeam,
+            redTeam: sides.redTeam,
+            blueTeamId: sides.blueTeamId,
+            redTeamId: sides.redTeamId,
+            bluePicks,
+            redPicks,
+            winnerSide,
+          });
+          if (evResult === "skipped") {
+            console.log(`[Grid] Game ${game.sequenceNumber} (${s.id}): events already parsed (resume)`);
+          } else if (evResult === "no-file") {
+            console.log(`[Grid] Game ${game.sequenceNumber} (${s.id}): no events file, skipping`);
+          } else {
+            eventsGames++;
+            console.log(
+              `[Grid] Game ${game.sequenceNumber} (${s.id}): events → R2 ${evResult.r2Key} (${evResult.guttedSizeBytes} B gz, ${evResult.eventCount} events, ${evResult.tickCount} ticks, ${evResult.cheeseFlags.length} cheese flags)`,
+            );
+          }
+        } catch (err) {
+          console.warn(
+            `[Grid] Game ${game.sequenceNumber} (${s.id}): events sub-step failed: ${err.message}`,
+          );
+          await upsertEventsFileRow(turso, {
+            seriesId: String(s.id),
+            gridGameId: String(game.id),
+            teamId: team.teamId,
+            tournament: tournamentName || s.tournament?.name || "Unknown",
+            gameDate,
+            blueTeam: sides.blueTeam,
+            redTeam: sides.redTeam,
+            blueTeamId: sides.blueTeamId,
+            redTeamId: sides.redTeamId,
+            status: "failed",
+            errorMessage: String(err.message).slice(0, 500),
+          }).catch((rowErr) => console.warn(`[Grid] events row write failed: ${rowErr.message}`));
+        }
+      }
 
       // Insert into team_games (Team import — tournament-driven)
       if (writeTeamGames) {
@@ -1153,8 +1700,8 @@ async function importTeamDataFromGrid(turso, team, tournamentEntry, opts = {}) {
               JSON.stringify(redPicks),
               JSON.stringify(blueBans),
               JSON.stringify(redBans),
-              s.teams?.[0]?.baseInfo?.name || null,
-              s.teams?.[1]?.baseInfo?.name || null,
+              sides.blueTeam,
+              sides.redTeam,
               draftSequence,
               game.sequenceNumber,
               String(s.id),
@@ -1169,7 +1716,8 @@ async function importTeamDataFromGrid(turso, team, tournamentEntry, opts = {}) {
       }
 
       // Summary file: needed for the team_games duration/roles update AND for
-      // per-player rows. Skipped only when neither is wanted for this game.
+      // per-player rows. Skipped only when neither is wanted for this game
+      // (the events sub-step above is independent of this skip).
       if (!writeTeamGames && !(writePlayerGames && inCompRange)) continue;
 
       // Download Riot summary file for participant data
@@ -1285,15 +1833,16 @@ async function importTeamDataFromGrid(turso, team, tournamentEntry, opts = {}) {
     await sleep(1000); // Rate limiting between series
   }
 
-  console.log(`[Grid] Imported ${importedGames} team games, ${importedPlayers} player game entries`);
+  console.log(`[Grid] Imported ${importedGames} team games, ${importedPlayers} player game entries, ${eventsGames} event files`);
   await reportProgress({
     step: "grid",
     status: "completed",
     totalImported: importedGames,
     totalPlayerEntries: importedPlayers,
+    eventsGames,
   });
 
-  return { importedGames, importedPlayers, seriesFound };
+  return { importedGames, importedPlayers, seriesFound, eventsGames };
 }
 
 // ─── Step 4b: Leaguepedia team import (fallback for non-Grid tournaments) ──
@@ -1685,6 +2234,11 @@ async function main() {
         totalImported,
         totalPlayerEntries,
       });
+      // Per-step import_log row — makes the MODE=resume team_import gate
+      // (isStepComplete) work. Only reached when the phase finished
+      // without an unhandled exception; a mid-phase throw skips this and
+      // the step re-runs on resume.
+      await logStep(turso, "team_import", totalImported);
     } else {
       console.log("[Resume] Team import already complete, skipping");
     }
@@ -1776,6 +2330,7 @@ async function main() {
         status: "completed",
         totalImported,
       });
+      await logStep(turso, "competitive", totalImported);
     } else {
       console.log("[Resume] Competitive already complete, skipping");
     }
@@ -1791,6 +2346,7 @@ async function main() {
 
       if (!RIOT_API_KEY) {
         console.error("[Fatal] RIOT_API_KEY not set, cannot run Riot API scan");
+        await logStep(turso, "soloq_riot_api", 0, "failed", "RIOT_API_KEY not set");
       } else {
         let totalFound = 0,
           totalImported = 0;
@@ -1819,6 +2375,7 @@ async function main() {
           totalFound,
           totalImported,
         });
+        await logStep(turso, "soloq_riot_api", totalImported);
       }
     } else {
       console.log("[Resume] Riot API SoloQ already complete, skipping");
@@ -1899,6 +2456,26 @@ async function main() {
     console.log("::endgroup::");
   }
 
+  // ── Step 8: Team patterns rollup (Sprint 7.1) ──────────────────────
+  // Aggregates the parsed gutted files of the team into the Firestore
+  // scoutedTeams/{teamId}/patternsSummary doc (~50 KB). Non-fatal.
+  if (team.teamId) {
+    console.log("::group::Step 8: Team Patterns Rollup");
+    try {
+      const rollup = await writeTeamPatternsRollup({ turso, team });
+      if (rollup.written) {
+        console.log(
+          `[Patterns] Wrote patternsSummary for ${rollup.gamesCount} games (${rollup.docBytes} B)`,
+        );
+      } else {
+        console.log(`[Patterns] Skipped: ${rollup.reason}`);
+      }
+    } catch (err) {
+      console.warn(`[Patterns] Rollup failed (non-fatal): ${err.message}`);
+    }
+    console.log("::endgroup::");
+  }
+
   // ── Single import_log row for the entire run ─────────────────────
   await logStep(
     turso,
@@ -1939,12 +2516,16 @@ module.exports = {
   importTeamDataFromLeaguepedia,
   scanRiotApi,
   extractTimelineDiffs,
+  processEventsFileForGame,
+  upsertEventsFileRow,
+  writeTeamPatternsRollup,
+  runInspectEvents,
   setChampionMapper(mapper) {
     championMapper = mapper;
   },
 };
 
-if (require.main === module) {
+if (require.main === module && INSPECT_EVENTS_INDEX === -1) {
   main().catch(async (error) => {
     console.error("[Fatal]", error);
     console.log("::endgroup::");

@@ -237,6 +237,68 @@ async function downloadRiotFile(seriesId, gameNumber, fileType) {
 }
 
 /**
+ * Download a game's events JSONL (Sprint 7.1) as a streaming Readable.
+ *
+ * The events file is large (100+ MB raw, uncompressed) and must never be
+ * buffered. Returns a Node Readable that the parser consumes line by line.
+ * Grid does not honor Range requests, so there is no head-peek — the caller
+ * streams the whole file or nothing.
+ *
+ * Content-Encoding is usually absent (plain JSONL); if Grid ever sends gzip
+ * we transparently gunzip. 404/403 (no events file for this game) → null.
+ *
+ * @returns {Promise<{stream: import('stream').Readable, contentLength: number}|null>}
+ */
+async function downloadEventsJsonl(seriesId, gameNumber) {
+  const url = `${GRID_BASE_URL}/file-download/events/riot/series/${seriesId}/games/${gameNumber}`;
+  const headers = { 'x-api-key': GRID_API_KEY };
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetch(url, { headers });
+
+      if (response.status === 429) {
+        const retryAfter = parseInt(response.headers.get('Retry-After') || '3', 10);
+        console.log(`[grid-client] Events download rate limited, sleeping ${retryAfter}s...`);
+        await sleep(retryAfter * 1000);
+        continue;
+      }
+
+      if (response.status === 404 || response.status === 403) {
+        console.log(
+          `[grid-client] No events file for series ${seriesId} game ${gameNumber} (${response.status})`,
+        );
+        return null;
+      }
+
+      if (!response.ok) {
+        throw new Error(`Events download error ${response.status}: ${await response.text()}`);
+      }
+
+      const { Readable } = require('stream');
+      const zlib = require('zlib');
+      const encoding = (response.headers.get('content-encoding') || '').toLowerCase();
+      let stream = Readable.fromWeb(response.body);
+      if (encoding.includes('gzip')) {
+        stream = stream.pipe(zlib.createGunzip());
+      }
+      const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
+      return { stream, contentLength };
+    } catch (error) {
+      if (attempt === MAX_RETRIES - 1) {
+        console.error(
+          `[grid-client] Failed to download events for series ${seriesId} game ${gameNumber}: ${error.message}`,
+        );
+        throw error;
+      }
+      console.log(`[grid-client] Events download retry ${attempt + 1}/${MAX_RETRIES}: ${error.message}`);
+      await sleep(2000);
+    }
+  }
+  return null;
+}
+
+/**
  * Parse a Riot summary file to extract participant data.
  * Returns array of participant objects with champion, role, stats.
  */
@@ -387,6 +449,7 @@ module.exports = {
   fetchSeriesByTeamId,
   fetchSeriesDraftData,
   downloadRiotFile,
+  downloadEventsJsonl,
   parseRiotSummaryFile,
   parseRiotTimelineAt15,
   parseDraftActions,
