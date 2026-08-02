@@ -400,10 +400,14 @@ function findOpponentChampion(matchParticipants, puuid) {
  * Extract lane differentials (CS / gold / XP vs the enemy laner) at 7 and
  * 14 minutes from a match timeline (Sprint 6.2).
  *
- * Primary: compare our participant frame against the enemy laner's frame
- * at the exact 7:00 / 14:00 timestamps. Fallback (when the enemy laner
- * cannot be resolved): Riot's own per-minute delta maps for CS/gold.
- * XP has no Riot delta map, so it is only filled from the frame comparison.
+ * Frame lookup: the frame CLOSEST to each minute mark (±30s sanity window).
+ * Real Riot timestamps carry jitter (the 7:00 frame is at 420142, not
+ * 420000), so exact timestamp matching never fires.
+ *
+ * Primary: compare our participant frame against the enemy laner's frame.
+ * Fallback (when the enemy laner cannot be resolved): Riot's own per-minute
+ * delta maps for CS/gold. XP has no Riot delta map, so it is only filled
+ * from the frame comparison.
  *
  * @param {Object} timeline  - Riot match v5 timeline payload
  * @param {Object} matchData - Riot match v5 match payload (participant ids)
@@ -433,8 +437,20 @@ function extractTimelineDiffs(timeline, matchData, puuid) {
   for (const [minute, minuteKey] of [[7, "7"], [14, "14"]]) {
     // Real Riot timeline timestamps are jittered (~100-300ms per frame,
     // e.g. the 7:00 frame is at 420142, not 420000) — exact equality never
-    // matches. Use the first frame AT OR AFTER the minute mark.
-    const frame = frames.find((f) => f.timestamp >= minute * 60 * 1000);
+    // matches. Standard industry approach: pick the frame CLOSEST to the
+    // minute mark, guarded by a ±30s sanity window (half the frame interval)
+    // so pathological data can't select a frame from a different minute.
+    const target = minute * 60 * 1000;
+    let frame = null;
+    let bestDiff = Infinity;
+    for (const f of frames) {
+      const d = Math.abs(f.timestamp - target);
+      if (d < bestDiff) {
+        bestDiff = d;
+        frame = f;
+      }
+    }
+    if (!frame || bestDiff > 30_000) continue;
     const ourFrame = frame?.participantFrames?.[p.participantId];
     if (!ourFrame) continue;
 
