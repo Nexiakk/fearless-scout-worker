@@ -2402,7 +2402,7 @@ async function main() {
       let thresholds = { ...DEFAULT_THRESHOLDS };
       try {
         const db = getFirestore();
-        const thresholdDoc = await db.collection('workspaces').doc(workspaceId)
+        const thresholdDoc = await db.collection('workspaces').doc(WORKSPACE_ID)
           .collection('_settings').doc('flagThresholds').get();
         if (thresholdDoc.exists) {
           thresholds = { ...DEFAULT_THRESHOLDS, ...thresholdDoc.data() };
@@ -2414,7 +2414,7 @@ async function main() {
       // Compute single-player flags for each player
       for (const player of players) {
         const playerFlags = await computePlayerFlags(turso, player.playerId, player.name || player.riotId || 'Unknown', thresholds);
-        await savePlayerFlags(workspaceId, player.playerId, playerFlags);
+        await savePlayerFlags(WORKSPACE_ID, player.playerId, playerFlags);
       }
 
       console.log(`[Flags] Computed flags for ${players.length} players`);
@@ -2440,7 +2440,7 @@ async function main() {
       const result = await writePlayerSourceSplits({
         turso,
         db,
-        workspaceId,
+        workspaceId: WORKSPACE_ID,
         players,
         scope: {
           startDate: dataStart || null,
