@@ -453,7 +453,7 @@ function extractTimelineDiffs(timeline, matchData, puuid) {
   return result;
 }
 
-async function scanRiotApi(turso, player, startTimestamp, endTimestamp, includeTimeline) {
+async function scanRiotApi(turso, player, startTimestamp, endTimestamp, includeTimeline = true) {
   const {
     playerId,
     riotId,
@@ -542,9 +542,8 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp, includeT
       .split("T")[0];
 
     // Optional timeline fetch (Sprint 6.2): extract CS/gold/XP lane
-    // differentials at 7 and 14 minutes. Doubles the API calls per game,
-    // so it is opt-in via OPTIONS_JSON.includeTimeline (default ON in the
-    // Import Data modal).
+    // differentials at 7 and 14 minutes. Doubles the API calls per game;
+    // enabled unless OPTIONS_JSON.includeTimeline is explicitly false.
     let timelineDiffs = null;
     if (includeTimeline) {
       const timeline = await riotFetch(
@@ -559,9 +558,12 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp, includeT
     const teamKills = matchData.info.participants
       .filter((part) => part.teamId === p.teamId)
       .reduce((sum, part) => sum + (part.kills || 0), 0);
+    // gameVersion lives on matchData.info, NOT on the participant object
+    // (a participant-level read is always undefined → patch would be null).
     const patch =
-      p.gameVersion && String(p.gameVersion).split(".").length >= 2
-        ? String(p.gameVersion).split(".").slice(0, 2).join(".")
+      matchData.info.gameVersion &&
+      String(matchData.info.gameVersion).split(".").length >= 2
+        ? String(matchData.info.gameVersion).split(".").slice(0, 2).join(".")
         : null;
 
     try {
@@ -589,20 +591,20 @@ async function scanRiotApi(turso, player, startTimestamp, endTimestamp, includeT
           p.win ? 1 : 0,
           role,
           matchIds[i],
-          p.timePlayed || null,
+          p.timePlayed ?? null,
           patch,
-          p.visionScore || null,
-          p.wardsPlaced || null,
-          p.wardsKilled || null,
-          p.detectorWardsPlaced || null,
-          p.totalDamageDealtToChampions || null,
-          p.totalDamageTaken || null,
-          p.damageDealtToTurrets || null,
+          p.visionScore ?? null,
+          p.wardsPlaced ?? null,
+          p.wardsKilled ?? null,
+          p.detectorWardsPlaced ?? null,
+          p.totalDamageDealtToChampions ?? null,
+          p.totalDamageTaken ?? null,
+          p.damageDealtToTurrets ?? null,
           teamKills > 0 ? (p.kills + p.assists) / teamKills : null,
           p.teamId === 100 ? "blue" : p.teamId === 200 ? "red" : null,
-          p.summoner1Id || null,
-          p.summoner2Id || null,
-          p.perks?.styles?.[0]?.selections?.[0]?.perk || null,
+          p.summoner1Id ?? null,
+          p.summoner2Id ?? null,
+          p.perks?.styles?.[0]?.selections?.[0]?.perk ?? null,
           timelineDiffs?.cs7 ?? null,
           timelineDiffs?.gold7 ?? null,
           timelineDiffs?.xp7 ?? null,
@@ -1595,9 +1597,11 @@ async function main() {
   const players = JSON.parse(PLAYERS_JSON);
   const options = JSON.parse(OPTIONS_JSON);
   const team = JSON.parse(TEAM_JSON);
-  // Timeline lane differentials (cs/gold/xp @7 & @14) are opt-in — one extra
-  // Riot API call per game. Import Data modal sends includeTimeline (default true).
-  const includeTimeline = options.includeTimeline === true;
+  // Timeline lane differentials (cs/gold/xp @7 & @14) — one extra Riot API
+  // call per game. Default ON when the key is absent (matches the Import
+  // Data modal checkbox, ticked by default); pass includeTimeline: false
+  // to disable.
+  const includeTimeline = options.includeTimeline !== false;
 
   if (!Array.isArray(players) || players.length === 0) {
     console.error("[Fatal] No players provided");
