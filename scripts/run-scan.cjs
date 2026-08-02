@@ -431,7 +431,10 @@ function extractTimelineDiffs(timeline, matchData, puuid) {
   );
 
   for (const [minute, minuteKey] of [[7, "7"], [14, "14"]]) {
-    const frame = frames.find((f) => f.timestamp === minute * 60 * 1000);
+    // Real Riot timeline timestamps are jittered (~100-300ms per frame,
+    // e.g. the 7:00 frame is at 420142, not 420000) — exact equality never
+    // matches. Use the first frame AT OR AFTER the minute mark.
+    const frame = frames.find((f) => f.timestamp >= minute * 60 * 1000);
     const ourFrame = frame?.participantFrames?.[p.participantId];
     if (!ourFrame) continue;
 
