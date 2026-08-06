@@ -54,11 +54,25 @@ function buildChampionSourcesSql({ playerId, workspaceId, startDate = null, endD
                  SUM(is_lp * win) AS lp_wins,
                  SUM(CASE WHEN is_grid = 1 AND is_lp = 1 THEN 1 ELSE 0 END) AS both_games,
                  SUM(CASE WHEN is_grid = 1 AND is_lp = 0 THEN 1 ELSE 0 END) AS grid_only,
-                 SUM(CASE WHEN is_grid = 0 AND is_lp = 1 THEN 1 ELSE 0 END) AS lp_only
+                 SUM(CASE WHEN is_grid = 0 AND is_lp = 1 THEN 1 ELSE 0 END) AS lp_only,
+                 MAX(game_date) AS last_played,
+                 ROUND(AVG(kills), 1) AS avg_kills,
+                 ROUND(AVG(deaths), 1) AS avg_deaths,
+                 ROUND(AVG(assists), 1) AS avg_assists,
+                 ROUND(AVG(CASE WHEN deaths > 0 THEN (kills + assists) / CAST(deaths AS REAL) ELSE kills + assists END), 2) AS avg_kda,
+                 MAX(role) AS role
           FROM (
             SELECT champion, game_date, opponent, win,
                    MAX(CASE WHEN source = 'grid' THEN 1 ELSE 0 END) AS is_grid,
-                   MAX(CASE WHEN source = 'leaguepedia' THEN 1 ELSE 0 END) AS is_lp
+                   MAX(CASE WHEN source = 'leaguepedia' THEN 1 ELSE 0 END) AS is_lp,
+                   COALESCE(MAX(CASE WHEN source = 'grid' THEN kills END),
+                            MAX(CASE WHEN source = 'leaguepedia' THEN kills END)) AS kills,
+                   COALESCE(MAX(CASE WHEN source = 'grid' THEN deaths END),
+                            MAX(CASE WHEN source = 'leaguepedia' THEN deaths END)) AS deaths,
+                   COALESCE(MAX(CASE WHEN source = 'grid' THEN assists END),
+                            MAX(CASE WHEN source = 'leaguepedia' THEN assists END)) AS assists,
+                   COALESCE(MAX(CASE WHEN source = 'grid' THEN role END),
+                            MAX(CASE WHEN source = 'leaguepedia' THEN role END)) AS role
             FROM competitive_games
             WHERE ${conditions.join(' AND ')}
             GROUP BY champion, game_date, opponent, win
@@ -148,6 +162,12 @@ function shapeChampionSources(rows) {
       lpOnly: toNum(r.lp_only),
       both: toNum(r.both_games),
     },
+    lastPlayed: r.last_played || null,
+    avgKills: toNum(r.avg_kills),
+    avgDeaths: toNum(r.avg_deaths),
+    avgAssists: toNum(r.avg_assists),
+    avgKda: toNum(r.avg_kda),
+    role: r.role || null,
   }))
 }
 

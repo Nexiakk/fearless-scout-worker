@@ -455,11 +455,12 @@ async function logStep(
   gameCount,
   status = "success",
   error = null,
+  teamId = null,
 ) {
   await turso.execute({
-    sql: `INSERT INTO import_log (workspace_id, import_type, game_count, status, error_message, imported_at)
-          VALUES (?, ?, ?, ?, ?, datetime('now'))`,
-    args: [WORKSPACE_ID, stepType, gameCount, status, error],
+    sql: `INSERT INTO import_log (workspace_id, team_id, import_type, game_count, status, error_message, imported_at)
+          VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
+    args: [WORKSPACE_ID, teamId, stepType, gameCount, status, error],
   });
 }
 
@@ -1346,6 +1347,56 @@ async function writeTeamPatternsRollup({ turso, team }) {
   return { written: true, gamesCount: gameList.length, docBytes: JSON.stringify(docData).length };
 }
 
+/**
+ * Sprint 9.2: stamp lastScoutedAt on the scanned team + player Firestore
+ * docs from import_log (latest successful/partial entry for this team).
+ * Dashboard freshness dots and "scouted X ago" labels read these fields.
+ * Non-fatal; skip when no Firestore. The caller gates on data steps so a
+ * flags-only run doesn't bump freshness.
+ */
+async function writeLastScoutedTimestamps({ turso, team, players = [] }) {
+  const db = await getFirestoreDb();
+  if (!db) return { written: false, reason: "no-firestore" };
+
+  const res = await turso.execute({
+    sql: `SELECT imported_at FROM import_log
+          WHERE workspace_id = ? AND team_id = ? AND status IN ('success', 'partial')
+          ORDER BY id DESC LIMIT 1`,
+    args: [WORKSPACE_ID, team.teamId],
+  });
+  const row = rowToObject(res.rows[0], res.columns);
+  if (!row?.imported_at) return { written: false, reason: "no-import-log-row" };
+
+  // datetime('now') writes "YYYY-MM-DD HH:MM:SS" in UTC.
+  const importedAt = new Date(String(row.imported_at).replace(" ", "T") + "Z");
+  if (Number.isNaN(importedAt.getTime())) {
+    return { written: false, reason: "bad-imported-at" };
+  }
+
+  const writes = [
+    db
+      .collection("workspaces")
+      .doc(WORKSPACE_ID)
+      .collection("scoutingTeams")
+      .doc(String(team.teamId))
+      .set({ lastScoutedAt: importedAt }, { merge: true }),
+  ];
+  for (const p of players) {
+    if (!p?.playerId) continue;
+    writes.push(
+      db
+        .collection("workspaces")
+        .doc(WORKSPACE_ID)
+        .collection("scoutingPlayers")
+        .doc(String(p.playerId))
+        .set({ lastScoutedAt: importedAt }, { merge: true }),
+    );
+  }
+
+  await Promise.allSettled(writes);
+  return { written: true, importedAt: importedAt.toISOString(), playerCount: players.length };
+}
+
 // ─── Step 4: Team Import ──────────────────────────────────────────────
 
 async function getTursoClient(dbName) {
@@ -2123,6 +2174,9 @@ async function computeAggregates(turso, playerIds) {
  *   5. Aggregation        — no-op (raw-query architecture)
  *   6. Flag Computation   — single-player flags (comparative not yet wired)
  *   7. Source Split Cache — scoutedPlayers/{pid}/sources (Sprint 5.5)
+ *   8. Team Patterns Rollup — scoutedTeams/{teamId}/patternsSummary
+ *   9. Last-Scouted Stamps — lastScoutedAt on team + player Firestore docs
+ *                            from import_log (Sprint 9.2)
  *
  * Dual-source contract: Grid and Leaguepedia write to competitive_games
  * independently. They use different ID spaces (grid_game_id vs
@@ -2238,7 +2292,7 @@ async function main() {
       // (isStepComplete) work. Only reached when the phase finished
       // without an unhandled exception; a mid-phase throw skips this and
       // the step re-runs on resume.
-      await logStep(turso, "team_import", totalImported);
+      await logStep(turso, "team_import", totalImported, "success", null, team.teamId);
     } else {
       console.log("[Resume] Team import already complete, skipping");
     }
@@ -2330,7 +2384,7 @@ async function main() {
         status: "completed",
         totalImported,
       });
-      await logStep(turso, "competitive", totalImported);
+      await logStep(turso, "competitive", totalImported, "success", null, team.teamId);
     } else {
       console.log("[Resume] Competitive already complete, skipping");
     }
@@ -2346,7 +2400,7 @@ async function main() {
 
       if (!RIOT_API_KEY) {
         console.error("[Fatal] RIOT_API_KEY not set, cannot run Riot API scan");
-        await logStep(turso, "soloq_riot_api", 0, "failed", "RIOT_API_KEY not set");
+        await logStep(turso, "soloq_riot_api", 0, "failed", "RIOT_API_KEY not set", team.teamId);
       } else {
         let totalFound = 0,
           totalImported = 0;
@@ -2375,7 +2429,7 @@ async function main() {
           totalFound,
           totalImported,
         });
-        await logStep(turso, "soloq_riot_api", totalImported);
+        await logStep(turso, "soloq_riot_api", totalImported, "success", null, team.teamId);
       }
     } else {
       console.log("[Resume] Riot API SoloQ already complete, skipping");
@@ -2483,7 +2537,30 @@ async function main() {
     totalGamesAllSteps,
     totalErrorsAllSteps > 0 ? "partial" : "success",
     totalErrorsAllSteps > 0 ? `${totalErrorsAllSteps} steps had errors` : null,
+    team.teamId,
   );
+
+  // ── Step 9: lastScoutedAt stamps (Sprint 9.2) ────────────────────
+  // Writes lastScoutedAt on the team + scanned player Firestore docs from
+  // import_log (latest successful entry for this team). Dashboard freshness
+  // dots + "scouted X ago" labels read these. Flags-only runs don't bump
+  // freshness — the gate below.
+  if (options.doSoloq || options.doCompetitive || options.doTeam) {
+    console.log("::group::Step 9: Last-Scouted Stamps");
+    try {
+      const result = await writeLastScoutedTimestamps({ turso, team, players });
+      if (result.written) {
+        console.log(
+          `[Freshness] Stamped lastScoutedAt ${result.importedAt} on team + ${result.playerCount} players`,
+        );
+      } else {
+        console.log(`[Freshness] Skipped: ${result.reason}`);
+      }
+    } catch (err) {
+      console.warn(`[Freshness] Stamp failed (non-fatal): ${err.message}`);
+    }
+    console.log("::endgroup::");
+  }
 
   // ── Done ─────────────────────────────────────────────────────────
   console.log("\n=== Scan Complete! ===");
@@ -2519,6 +2596,7 @@ module.exports = {
   processEventsFileForGame,
   upsertEventsFileRow,
   writeTeamPatternsRollup,
+  writeLastScoutedTimestamps,
   runInspectEvents,
   setChampionMapper(mapper) {
     championMapper = mapper;
